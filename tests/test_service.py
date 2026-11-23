@@ -259,6 +259,19 @@ class SyncTests(unittest.TestCase):
         thumbnail = client.get(f"/thumbnail/{encoded}")
         self.assertEqual(thumbnail.mimetype, "image/jpeg")
 
+    def test_gallery_long_filenames_wrap_and_keep_full_title(self):
+        filename = "a" * 100 + ".jpg"
+        (self.images / filename).write_bytes(jpeg_bytes("red"))
+        app = create_app(self.service)
+        app.testing = True
+
+        page = app.test_client().get("/")
+
+        self.assertIn(f'title="{filename}"'.encode(), page.data)
+        self.assertIn(filename.encode(), page.data)
+        self.assertIn(b".card{min-width:0}", page.data)
+        self.assertIn(b".filename{overflow-wrap:anywhere}", page.data)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,7 +19,7 @@ PAGE = """<!doctype html>
 body{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;color:#222}
 label{display:inline-block;margin:.5rem 1rem .5rem 0}button,select,input{font:inherit;padding:.45rem}
 .notice{padding:.7rem;background:#fff2cc;margin:.5rem 0}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:1rem}
-.card img{width:100%;height:130px;object-fit:cover;background:#181818}.muted{color:#555;font-size:.9rem}
+.card{min-width:0}.card img{width:100%;height:130px;object-fit:cover;background:#181818}.filename{overflow-wrap:anywhere}.muted{color:#555;font-size:.9rem}
 </style></head><body>
 <h1>Frame Art Mode</h1>
 <p>Active set: <strong>{{ display_names.get(status.active_set, 'None') }}</strong>.
@@ -44,7 +44,7 @@ label{display:inline-block;margin:.5rem 1rem .5rem 0}button,select,input{font:in
 <p class="muted">Changes on disk are picked up only when you explicitly sync. Hidden items, @eaDir and non-image files are ignored.</p>
 <div class="grid">{% for image in images %}
 <div class="card"><img loading="lazy" src="{{ url_for('thumbnail', encoded=encode_path(image.source_rel)) }}" alt="">
-<div>{{ image.name_rel }}</div><form method="post" action="{{ url_for('preview') }}">
+<div class="filename" title="{{ image.name_rel }}">{{ image.name_rel }}</div><form method="post" action="{{ url_for('preview') }}">
 <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
 <input type="hidden" name="content_id" value="{{ content_by_source.get(image.source_rel, '') }}">
 {% if content_by_source.get(image.source_rel) %}<button type="submit">Preview 15 seconds</button>{% endif %}
