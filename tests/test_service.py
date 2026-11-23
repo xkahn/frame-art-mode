@@ -1,5 +1,6 @@
 import io
 import tempfile
+import threading
 import unittest
 import base64
 from pathlib import Path
@@ -22,6 +23,7 @@ class FakeArt:
         self.items = {}
         self.upload_count = 0
         self.fail_upload = False
+        self.fail_upload_message = "upload rejected"
         self.fail_on_upload_number = None
         self.fail_delete = set()
         self.mode = "on"
@@ -32,13 +34,24 @@ class FakeArt:
         self.current_category = None
         self.return_none = False
         self.on_upload = None
+        self.available_gate = None
+        self.on_favorites = None
+        self.on_select = None
 
     def get_artmode(self):
         return self.mode
 
     def available(self, category=None):
         self.calls.append(("available", category))
+        if self.available_gate:
+            entered, release = self.available_gate
+            self.available_gate = None
+            entered.set()
+            release.wait(timeout=5)
         if category == ART_STORE_FAVORITES_CATEGORY:
+            if self.on_favorites:
+                callback, self.on_favorites = self.on_favorites, None
+                callback()
             if self.fail_favorites:
                 self.fail_favorites = False
                 raise RuntimeError("favorites unavailable")
@@ -50,7 +63,7 @@ class FakeArt:
         self.upload_count += 1
         if self.fail_upload or self.upload_count == self.fail_on_upload_number:
             self.fail_upload = False
-            raise RuntimeError("upload rejected")
+            raise RuntimeError(self.fail_upload_message)
         content_id = f"APP-{self.upload_count}"
         self.items[content_id] = data
         if self.on_upload:
@@ -69,6 +82,8 @@ class FakeArt:
         self.current = content_id
         self.current_category = category
         self.calls.append(("select", content_id, category))
+        if self.on_select:
+            self.on_select()
 
     def get_current(self):
         return {"content_id": self.current, "category": self.current_category}
@@ -117,6 +132,7 @@ class SyncTests(unittest.TestCase):
         try:
             self.assertEqual(reopened.status()["active_set"], "root")
             self.assertEqual(reopened.status()["entries"][0]["content_id"], active_id)
+            self.assertEqual(reopened.status()["last_result"]["state"], "completed")
             self.assertEqual(self.art.upload_count, 2)
         finally:
             reopened.stop()
@@ -140,6 +156,26 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.service.status()["entries"][0]["content_id"], old_id)
         self.assertIn(old_id, self.art.items)
         self.assertNotIn(old_id, [item[1] for item in self.art.calls if item[0] == "delete"])
+
+    def test_tv_timeout_records_failure_and_requires_explicit_retry(self):
+        old_id = self.service.sync("root")["entries"][0]["content_id"]
+        (self.images / "photo.jpg").write_bytes(jpeg_bytes("blue"))
+        self.art.fail_upload = True
+        self.art.fail_upload_message = "TV request timed out"
+
+        with self.assertRaisesRegex(ServiceError, "previously active"):
+            self.service.sync("root")
+
+        result = self.service.status()["last_result"]
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("TV request timed out", result["message"])
+        self.assertTrue(result["timestamp"])
+        self.assertEqual(self.service.status()["entries"][0]["content_id"], old_id)
+        self.assertIn(old_id, self.art.items)
+
+        retried = self.service.sync("root")
+        self.assertEqual(retried["last_result"]["state"], "completed")
+        self.assertNotEqual(retried["entries"][0]["content_id"], old_id)
 
     def test_later_upload_failure_rolls_back_only_this_attempts_success(self):
         old_id = self.service.sync("root")["entries"][0]["content_id"]
@@ -211,10 +247,12 @@ class SyncTests(unittest.TestCase):
         restore_id = self.art.current
         preview_id = second if restore_id == first else first
         self.service.preview(preview_id)
+        self.assertEqual(self.service.status()["operation"]["kind"], "preview")
         self.assertEqual(self.art.current, preview_id)
         with self.assertRaisesRegex(ServiceError, "currently synced set"):
             self.service.preview("SAMSUNG-ART")
         self.assertEqual(self.service._preview_restore_id, restore_id)
+        self.assertEqual(self.service.status()["operation"]["kind"], "preview")
 
     def test_unreadable_manifest_fails_closed(self):
         active = self.service.sync("root")["entries"][0]["content_id"]
@@ -256,6 +294,10 @@ class SyncTests(unittest.TestCase):
         page = client.get("/")
         self.assertEqual(page.status_code, 200)
         self.assertIn(b"Sync to TV", page.data)
+        if self.service._operation_thread:
+            self.service._operation_thread.join(timeout=2)
+        self.assertTrue(self.service.status()["tv_ready"])
+        self.assertEqual(self.service.status()["last_result"]["kind"], "reachability")
         self.assertEqual(client.post("/settings", data={"set_id": "root"}).status_code, 400)
         with client.session_transaction() as browser_session:
             csrf = browser_session["csrf_token"]
@@ -275,6 +317,92 @@ class SyncTests(unittest.TestCase):
         encoded = base64.urlsafe_b64encode(b"photo.jpg").decode().rstrip("=")
         thumbnail = client.get(f"/thumbnail/{encoded}")
         self.assertEqual(thumbnail.mimetype, "image/jpeg")
+
+    def test_background_sync_status_survives_browser_reconnect_and_reports_progress(self):
+        app = create_app(self.service)
+        app.testing = True
+        client = app.test_client()
+        client.get("/")
+        if self.service._operation_thread:
+            self.service._operation_thread.join(timeout=2)
+        with client.session_transaction() as browser_session:
+            csrf = browser_session["csrf_token"]
+
+        entered = threading.Event()
+        release = threading.Event()
+        self.art.on_upload = lambda: setattr(
+            self.art, "available_gate", (entered, release)
+        )
+        try:
+            response = client.post(
+                "/sync",
+                data={
+                    "set_id": "root",
+                    "interval_minutes": "15",
+                    "csrf_token": csrf,
+                },
+            )
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(entered.wait(timeout=2))
+
+            reconnected = app.test_client()
+            status = reconnected.get("/status").get_json()
+            self.assertEqual(status["operation"]["kind"], "sync")
+            self.assertEqual(status["operation"]["phase"], "waiting-for-tv-confirmation")
+            self.assertEqual(status["operation"]["current_image"], "photo.jpg")
+            self.assertEqual(status["operation"]["completed_files"], 0)
+            self.assertEqual(status["operation"]["total_files"], 1)
+            self.assertNotIn("known_uploaded", status["operation"])
+            self.assertIn(b"waiting-for-tv-confirmation", reconnected.get("/").data)
+            self.assertIn(b"photo.jpg", reconnected.get("/").data)
+            client.post(
+                "/sync",
+                data={
+                    "set_id": "root",
+                    "interval_minutes": "31",
+                    "csrf_token": csrf,
+                },
+            )
+            self.assertEqual(self.service.settings_for("root")["interval_minutes"], 15)
+        finally:
+            release.set()
+            if self.service._operation_thread:
+                self.service._operation_thread.join(timeout=5)
+
+        completed = app.test_client().get("/status").get_json()
+        self.assertIsNone(completed["operation"])
+        self.assertEqual(completed["last_result"]["state"], "completed")
+
+    def test_restart_marks_sync_interrupted_and_recovers_known_partial_uploads(self):
+        active_id = self.service.sync("root")["entries"][0]["content_id"]
+        partial_id = "APP-PARTIAL"
+        self.art.items[partial_id] = b"partial"
+        self.service._begin_operation("sync", "uploading", "Uploading photo.jpg")
+        self.service._remember_uploaded(partial_id)
+
+        self.service.stop()
+        reopened = FrameService(
+            self.config, tv_factory=lambda config, token: self.art, sleeper=self.sleeps.append
+        )
+        try:
+            interrupted = reopened.status()
+            self.assertIsNone(interrupted["operation"])
+            self.assertEqual(interrupted["last_result"]["state"], "interrupted")
+            self.assertEqual(interrupted["entries"][0]["content_id"], active_id)
+            self.assertEqual(interrupted["cleanup_pending"], [partial_id])
+            self.assertIn(partial_id, self.art.items)
+
+            reopened.check_tv_status_async()
+            if reopened._operation_thread:
+                reopened._operation_thread.join(timeout=2)
+            self.assertEqual(reopened.status()["last_result"]["state"], "interrupted")
+
+            retried = reopened.sync("root")
+            self.assertEqual(retried["cleanup_pending"], [])
+            self.assertNotIn(partial_id, self.art.items)
+            self.assertIn(active_id, self.art.items)
+        finally:
+            reopened.stop()
 
     def test_art_store_favorites_setting_defaults_off_and_saves_per_set(self):
         occasion = self.images / "Party"
@@ -353,6 +481,29 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.art.current_category, ART_STORE_FAVORITES_CATEGORY)
         self.assertEqual(self.service._next_at, 100 + 15 * 60)
         self.assertIsNone(self.service._preview_restore_category)
+        self.assertEqual(self.service.status()["last_result"]["state"], "completed")
+
+    def test_slideshow_and_favorites_queries_are_visible_in_operation_status(self):
+        self.art.favorites = [{"content_id": "SAM-ART-1"}]
+        self.service.save_settings("root", True, 15, True)
+        self.service.sync("root")
+        self.assertTrue(self.service.settings_for("root")["mix_art_store_favorites"])
+        self.assertTrue(self.service.settings_for("root")["random"])
+        observed_phases = []
+        self.art.on_favorites = lambda: observed_phases.append(
+            self.service.status()["operation"]["phase"]
+        )
+        self.art.on_select = self.service._stop.set
+        self.service._next_at = self.service.clock() - 1
+        self.assertFalse(self.service._syncing)
+        self.assertFalse(self.service._stop.is_set())
+        self.assertIsNone(self.service.status()["operation"])
+
+        self.service._cycle()
+
+        self.assertEqual(observed_phases, ["querying-favorites"])
+        self.assertEqual(self.service.status()["last_result"]["kind"], "slideshow-selection")
+        self.assertEqual(self.service.status()["last_result"]["state"], "completed")
 
     def test_gallery_long_filenames_wrap_and_keep_full_title(self):
         filename = "a" * 100 + ".jpg"

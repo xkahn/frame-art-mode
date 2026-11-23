@@ -24,3 +24,8 @@
   content IDs, source fingerprints, selected set, and per-set playback settings.
 - **Preview**: A temporary selection of an image already in the active set,
   followed by restoration of the image that had been on screen.
+- **TV communication status**: The durable current-operation snapshot and most
+  recent outcome, including its timestamp; it is not an event history.
+- **Interrupted sync**: A sync that was running when the service restarted.
+  The last committed active set remains selected, and only known partial uploads are
+  queued as cleanup-pending for the next explicit sync.
