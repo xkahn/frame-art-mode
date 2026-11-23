@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import fcntl
+import logging
 import random
 import tempfile
 import threading
@@ -639,6 +640,8 @@ class FrameService:
         try:
             self._sync(set_id)
         except Exception as exc:
+            # TEMP: remove after collecting the deployed WebSocket traceback.
+            logging.getLogger(__name__).exception("background TV sync failed")
             self._finish_operation("failed", str(exc), "sync")
         else:
             self._finish_operation("completed", "Sync completed", "sync")

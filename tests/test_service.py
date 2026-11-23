@@ -177,6 +177,22 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(retried["last_result"]["state"], "completed")
         self.assertNotEqual(retried["entries"][0]["content_id"], old_id)
 
+    def test_background_sync_logs_readiness_exception_traceback(self):
+        old_id = self.service.sync("root")["entries"][0]["content_id"]
+
+        def fail_readiness():
+            raise RuntimeError("Invalid close opcode 1005")
+
+        self.art.get_artmode = fail_readiness
+        with self.assertLogs("frame_art_mode.service", level="ERROR") as captured:
+            self.service.start_sync("root")
+            self.service._operation_thread.join(timeout=3)
+
+        self.assertIn("Traceback (most recent call last)", "\n".join(captured.output))
+        self.assertIn("Invalid close opcode 1005", "\n".join(captured.output))
+        self.assertEqual(self.service.status()["entries"][0]["content_id"], old_id)
+        self.assertEqual(self.service.status()["last_result"]["state"], "failed")
+
     def test_later_upload_failure_rolls_back_only_this_attempts_success(self):
         old_id = self.service.sync("root")["entries"][0]["content_id"]
         (self.images / "photo.jpg").write_bytes(jpeg_bytes("blue"))
