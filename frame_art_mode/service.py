@@ -7,6 +7,7 @@ import random
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -61,11 +62,14 @@ class FrameService:
             self._lock_file.close()
             raise ServiceError(f"another Frame Art Mode instance is already managing TV {config.tv_ip}") from exc
         self.manifest_path = self.tv_dir / "manifest.json"
+        self.operation_path = self.tv_dir / "operation.json"
         self.token_file = self.tv_dir / "tv-token.txt"
         self._manifest_persisted = self.manifest_path.exists()
         self._lock = threading.RLock()
+        self._operation_lock = threading.RLock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._operation_thread: threading.Thread | None = None
         self._syncing = False
         self._last_error: str | None = None
         self._last_warnings: list[str] = []
@@ -78,11 +82,239 @@ class FrameService:
         self._next_at = self.clock()
         self._paused_remaining: float | None = None
         self._manifest = self._load_manifest()
+        self._operation = self._load_operation()
+        self._recover_interrupted_operation()
         if self._manifest:
             self._current_content_id = self._manifest.get("current_content_id")
             if self._manifest.get("entries") and self._manifest.get("active_set"):
                 minutes = self.settings_for(self._manifest["active_set"])["interval_minutes"]
                 self._next_at = self.clock() + minutes * 60
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def _load_operation(self) -> dict[str, Any]:
+        if not self.operation_path.exists():
+            return {"current": None, "last_result": None}
+        try:
+            data = json.loads(self.operation_path.read_text(encoding="utf-8"))
+            if (
+                not isinstance(data, dict)
+                or not isinstance(data.get("current"), (dict, type(None)))
+                or not isinstance(data.get("last_result"), (dict, type(None)))
+            ):
+                raise ValueError("operation status fields are invalid")
+            current = data.get("current")
+            last_result = data.get("last_result")
+            if current is not None and (
+                not isinstance(current.get("kind"), str)
+                or not isinstance(current.get("phase"), str)
+                or not isinstance(current.get("known_uploaded", []), list)
+                or not all(isinstance(item, str) and item for item in current.get("known_uploaded", []))
+            ):
+                raise ValueError("current operation fields are invalid")
+            if last_result is not None and not all(
+                isinstance(last_result.get(key), str)
+                for key in ("kind", "state", "message", "timestamp")
+            ):
+                raise ValueError("last operation result fields are invalid")
+            if last_result is not None and (
+                not isinstance(last_result.get("recovery_pending", []), list)
+                or not all(
+                    isinstance(item, str) and item
+                    for item in last_result.get("recovery_pending", [])
+                )
+            ):
+                raise ValueError("interrupted upload recovery fields are invalid")
+            return {"current": current, "last_result": last_result}
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise ServiceError(f"TV operation status is unreadable: {exc}") from exc
+
+    def _persist_operation(self) -> None:
+        data = json.dumps(self._operation, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+        with tempfile.NamedTemporaryFile(dir=self.tv_dir, prefix=".operation-", delete=False) as handle:
+            temporary = Path(handle.name)
+            try:
+                handle.write(data)
+                handle.flush()
+                temporary.chmod(0o600)
+                temporary.replace(self.operation_path)
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
+
+    def _recover_interrupted_operation(self) -> None:
+        current = self._operation.get("current")
+        last_result = self._operation.get("last_result")
+        if current is None and not (
+            last_result and last_result.get("recovery_pending")
+        ):
+            return
+        kind = current.get("kind", "TV operation") if current else last_result["kind"]
+        known_uploads = (
+            current.get("known_uploaded", [])
+            if current and kind == "sync"
+            else last_result.get("recovery_pending", [])
+            if last_result
+            else []
+        )
+        recovery_pending = []
+        if kind == "sync" and isinstance(known_uploads, list) and not self._manifest_error:
+            active_ids = {
+                entry["content_id"] for entry in self._manifest.get("entries", [])
+                if isinstance(entry, dict) and isinstance(entry.get("content_id"), str)
+            }
+            cleanup = list(dict.fromkeys(
+                self._manifest.get("cleanup_pending", [])
+                + [item for item in known_uploads if isinstance(item, str) and item not in active_ids]
+            ))
+            if cleanup != self._manifest.get("cleanup_pending", []):
+                updated = dict(self._manifest)
+                updated["cleanup_pending"] = cleanup
+                self._write_manifest(updated)
+            if last_result and last_result.get("recovery_pending"):
+                updated_result = dict(last_result)
+                updated_result.pop("recovery_pending", None)
+                self._operation["last_result"] = updated_result
+                self._persist_operation()
+        elif kind == "sync":
+            recovery_pending = list(dict.fromkeys(known_uploads))
+        if current is not None:
+            message = f"{kind.capitalize()} was interrupted by a service restart."
+            if kind == "sync":
+                if self._manifest_error and recovery_pending:
+                    message += (
+                        " The ownership manifest is unreadable, so known partial uploads "
+                        "were retained for recovery; no TV items will be deleted."
+                    )
+                else:
+                    message += (
+                        " The last committed active set was left unchanged by recovery; "
+                        "known partial uploads are cleanup-pending and will be reconciled "
+                        "on the next explicit Sync."
+                    )
+            result = {
+                "kind": kind,
+                "state": "interrupted",
+                "message": message,
+                "timestamp": self._timestamp(),
+            }
+            if recovery_pending:
+                result["recovery_pending"] = recovery_pending
+            self._operation = {"current": None, "last_result": result}
+            self._persist_operation()
+
+    def _begin_operation(
+        self, kind: str, phase: str, message: str, total_files: int = 0
+    ) -> None:
+        with self._operation_lock:
+            if self._operation.get("current") is not None:
+                raise ServiceError("another TV operation is already in progress")
+            self._operation["current"] = {
+                "kind": kind,
+                "phase": phase,
+                "message": message,
+                "current_image": None,
+                "completed_files": 0,
+                "total_files": total_files,
+                "started_at": self._timestamp(),
+                "known_uploaded": [],
+            }
+            self._persist_operation()
+
+    def _update_operation(
+        self,
+        phase: str,
+        message: str,
+        current_image: str | None = None,
+        completed_files: int | None = None,
+        total_files: int | None = None,
+    ) -> None:
+        with self._operation_lock:
+            current = self._operation.get("current")
+            if current is None:
+                return
+            current.update(phase=phase, message=message, current_image=current_image)
+            if completed_files is not None:
+                current["completed_files"] = completed_files
+            if total_files is not None:
+                current["total_files"] = total_files
+            self._persist_operation()
+
+    def _remember_uploaded(self, content_id: str) -> None:
+        with self._operation_lock:
+            current = self._operation.get("current")
+            if current is None or current.get("kind") != "sync":
+                return
+            if content_id not in current["known_uploaded"]:
+                current["known_uploaded"].append(content_id)
+                try:
+                    self._persist_operation()
+                except Exception as exc:
+                    raise UploadError(
+                        f"could not persist the ID of uploaded item {content_id}: {exc}",
+                        content_id,
+                    ) from exc
+
+    def _finish_operation(
+        self,
+        state: str,
+        message: str,
+        kind: str | None = None,
+        preserve_previous_result: bool = False,
+    ) -> None:
+        with self._operation_lock:
+            current = self._operation.get("current")
+            if current is None or (kind is not None and current.get("kind") != kind):
+                return
+            last_result = self._operation.get("last_result")
+            if not preserve_previous_result or last_result is None:
+                last_result = {
+                    "kind": current.get("kind", "TV operation"),
+                    "state": state,
+                    "message": message,
+                    "timestamp": self._timestamp(),
+                }
+            self._operation = {
+                "current": None,
+                "last_result": last_result,
+            }
+            self._persist_operation()
+
+    def _current_operation(self) -> dict[str, Any] | None:
+        with self._operation_lock:
+            current = self._operation.get("current")
+            return dict(current) if current else None
+
+    def check_tv_status_async(self) -> None:
+        with self._operation_lock:
+            if self._tv_ready is not None or self._operation.get("current") is not None:
+                return
+            self._begin_operation("reachability", "checking-tv", "Checking TV reachability")
+            try:
+                self._operation_thread = threading.Thread(
+                    target=self._check_tv_status, name="frame-art-status", daemon=True
+                )
+                self._operation_thread.start()
+            except Exception as exc:
+                self._finish_operation("failed", str(exc), "reachability")
+                raise
+
+    def _check_tv_status(self) -> None:
+        try:
+            self._check_ready(self._art())
+        except Exception as exc:
+            message = str(exc)
+            self._last_error = message
+            self._finish_operation("failed", message, "reachability")
+        else:
+            self._finish_operation(
+                "completed",
+                "TV is reachable and in Art Mode",
+                "reachability",
+                preserve_previous_result=True,
+            )
 
     def _empty_manifest(self) -> dict[str, Any]:
         return {
@@ -227,10 +459,22 @@ class FrameService:
         }
 
     def save_settings(
-        self, set_id: str, randomize: bool, interval_minutes: int, mix_art_store_favorites: bool
+        self,
+        set_id: str,
+        randomize: bool,
+        interval_minutes: int,
+        mix_art_store_favorites: bool,
+        allow_during_sync: bool = False,
     ) -> None:
         if interval_minutes < 1:
             raise ServiceError("interval must be at least one minute")
+        operation = self._current_operation()
+        if (
+            operation is not None
+            and operation.get("kind") == "sync"
+            and not allow_during_sync
+        ):
+            raise ServiceError("settings cannot be changed while Sync to TV is running")
         with self._lock:
             manifest = self._require_manifest()
             updated = dict(manifest)
@@ -255,6 +499,7 @@ class FrameService:
         candidates = [dict(entry) for entry in entries]
         content_ids = {entry["content_id"] for entry in candidates}
         if mix_art_store_favorites:
+            self._update_operation("querying-favorites", "Querying Art Store favorites")
             try:
                 available = art.available(ART_STORE_FAVORITES_CATEGORY)
                 if not isinstance(available, list):
@@ -299,9 +544,18 @@ class FrameService:
             self.sleeper(1)
 
     def _upload(self, art: Any, image: PreparedImage, existing_ids: set[str]) -> str:
+        self._update_operation(
+            "uploading", f"Uploading {image.filename}", image.source_rel
+        )
         content_id = art.upload(image.staged_path.read_bytes(), file_type="JPEG")
         if content_id is not None:
             content_id = str(content_id)
+            self._remember_uploaded(content_id)
+        self._update_operation(
+            "waiting-for-tv-confirmation",
+            f"Waiting for TV to confirm {image.filename}",
+            image.source_rel,
+        )
         try:
             for attempt in range(6):
                 available = self._content_ids(art.available())
@@ -309,7 +563,9 @@ class FrameService:
                     return content_id
                 added = available - existing_ids
                 if content_id is None and len(added) == 1:
-                    return next(iter(added))
+                    content_id = next(iter(added))
+                    self._remember_uploaded(content_id)
+                    return content_id
                 if attempt < 5:
                     self.sleeper(1)
         except Exception as exc:
@@ -324,10 +580,16 @@ class FrameService:
             )
         raise UploadError(f"TV did not confirm or expose the uploaded item {image.source_rel}")
 
-    def _delete_batch(self, art: Any, content_ids: list[str]) -> tuple[list[str], list[str]]:
+    def _delete_batch(
+        self, art: Any, content_ids: list[str], phase: str = "deleting"
+    ) -> tuple[list[str], list[str]]:
         pending: list[str] = []
         errors: list[str] = []
         for index, content_id in enumerate(content_ids):
+            self._update_operation(
+                phase, f"Deleting managed TV item {index + 1}/{len(content_ids)}",
+                content_id, index, len(content_ids),
+            )
             try:
                 result = art.delete(content_id)
                 if result is not True:
@@ -337,13 +599,61 @@ class FrameService:
                 pending.append(content_id)
                 errors.append(f"{content_id}: {exc}")
             self._pace(index, len(content_ids))
+        if content_ids:
+            self._update_operation(phase, "TV item deletion complete", None, len(content_ids), len(content_ids))
         return pending, errors
 
     def sync(self, set_id: str) -> dict[str, Any]:
+        self._begin_operation("sync", "starting", "Starting sync")
+        self._syncing = True
+        try:
+            self._sync(set_id)
+        except Exception as exc:
+            self._finish_operation("failed", str(exc), "sync")
+            raise
+        else:
+            self._finish_operation("completed", "Sync completed", "sync")
+            return self.status()
+        finally:
+            self._syncing = False
+
+    def start_sync(
+        self, set_id: str, settings: tuple[bool, int, bool] | None = None
+    ) -> dict[str, Any]:
+        self._begin_operation("sync", "starting", "Starting sync")
+        self._syncing = True
+        try:
+            if settings is not None:
+                self.save_settings(set_id, *settings, allow_during_sync=True)
+            self._operation_thread = threading.Thread(
+                target=self._run_background_sync, args=(set_id,), name="frame-art-sync", daemon=True
+            )
+            self._operation_thread.start()
+        except Exception as exc:
+            self._syncing = False
+            self._finish_operation("failed", str(exc), "sync")
+            raise
+        return self.status()
+
+    def _run_background_sync(self, set_id: str) -> None:
+        try:
+            self._sync(set_id)
+        except Exception as exc:
+            self._finish_operation("failed", str(exc), "sync")
+        else:
+            self._finish_operation("completed", "Sync completed", "sync")
+        finally:
+            self._syncing = False
+
+    def _sync(self, set_id: str) -> dict[str, Any]:
         with self._lock:
             self._syncing = True
             self._last_error = None
             try:
+                self._update_operation("checking-tv", "Checking TV reachability")
+                art = self._art()
+                self._check_ready(art)
+                self._update_operation("preparing", "Preparing image snapshot")
                 manifest = self._require_manifest()
                 sets, scan_warnings = self.list_sets()
                 if set_id not in sets:
@@ -365,23 +675,31 @@ class FrameService:
                         )
                     if not prepared:
                         raise ServiceError("no valid images remain; the current TV set was left unchanged")
+                    self._update_operation(
+                        "checking-tv", "Checking TV reachability", None, 0, len(prepared)
+                    )
 
                     old_by_source = {
                         (entry.get("source_rel"), entry.get("fingerprint")): entry
                         for entry in manifest["entries"]
                     }
 
-                    art = self._art()
                     self._check_ready(art)
                     before = self._content_ids(art.available())
                     desired: list[dict[str, Any]] = []
                     uploaded: list[str] = []
                     upload_errors: list[str] = []
                     upload_attempts = 0
+                    uploaded_count = 0
                     for image in prepared:
                         previous = old_by_source.get((image.source_rel, image.fingerprint))
                         if previous and previous["content_id"] in before:
                             desired.append(dict(previous))
+                            uploaded_count += 1
+                            self._update_operation(
+                                "uploading", f"Using existing {image.filename}", image.source_rel,
+                                uploaded_count, len(prepared),
+                            )
                             continue
                         upload_attempts += 1
                         try:
@@ -389,6 +707,7 @@ class FrameService:
                             if content_id in before or content_id in uploaded:
                                 raise ServiceError(f"TV returned a duplicate content ID for {image.source_rel}")
                             uploaded.append(content_id)
+                            uploaded_count += 1
                             desired.append(
                                 {
                                     "source_rel": image.source_rel,
@@ -401,6 +720,13 @@ class FrameService:
                             if isinstance(exc, UploadError) and exc.content_id:
                                 uploaded.append(exc.content_id)
                             upload_errors.append(f"{image.source_rel}: {exc}")
+                        self._update_operation(
+                            "uploading",
+                            f"Processed {uploaded_count}/{len(prepared)} images",
+                            image.source_rel,
+                            uploaded_count,
+                            len(prepared),
+                        )
                         self._pace(
                             upload_attempts - 1,
                             sum(
@@ -410,6 +736,13 @@ class FrameService:
                         )
 
                     if upload_attempts:
+                        self._update_operation(
+                            "waiting-for-tv-confirmation",
+                            "Waiting for the TV to finish processing uploaded images",
+                            None,
+                            uploaded_count,
+                            len(prepared),
+                        )
                         self.sleeper(12)
                     if not upload_errors:
                         try:
@@ -417,7 +750,9 @@ class FrameService:
                         except ServiceError as exc:
                             upload_errors.append(f"TV: {exc}")
                     if upload_errors:
-                        rollback_pending, rollback_errors = self._delete_batch(art, uploaded)
+                        rollback_pending, rollback_errors = self._delete_batch(
+                            art, uploaded, "rolling-back"
+                        )
                         if uploaded:
                             self.sleeper(12)
                         preserved = dict(manifest)
@@ -427,7 +762,11 @@ class FrameService:
                         if rollback_pending:
                             self._write_manifest(preserved)
                         self._last_warnings += upload_errors + rollback_errors
-                        raise ServiceError("upload batch failed; the previously active TV set was preserved")
+                        details = "; ".join(upload_errors)
+                        raise ServiceError(
+                            "upload batch failed; the previously active TV set was preserved"
+                            + (f": {details}" if details else "")
+                        )
 
                     desired_ids = {entry["content_id"] for entry in desired}
                     old_ids = [entry["content_id"] for entry in manifest["entries"] if entry["content_id"] not in desired_ids]
@@ -447,6 +786,7 @@ class FrameService:
                     updated["settings"] = dict(manifest.get("settings", {}))
                     updated["settings"][set_id] = settings
                     try:
+                        self._update_operation("committing", "Activating the new image set")
                         self._write_manifest(updated)
                     except Exception as exc:
                         rollback_pending, rollback_errors = self._delete_batch(art, uploaded)
@@ -468,15 +808,28 @@ class FrameService:
 
                     pending, delete_errors = self._delete_batch(art, cleanup)
                     if cleanup:
+                        self._update_operation(
+                            "waiting-for-tv-confirmation",
+                            "Waiting for TV to finish deleting managed items",
+                            None,
+                            len(cleanup),
+                            len(cleanup),
+                        )
                         self.sleeper(12)
                     updated = dict(self._manifest)
                     updated["cleanup_pending"] = pending
                     display_error = None
                     if desired:
+                        self._update_operation("selecting", "Selecting the first image")
                         initial = (
                             self._random_pick(art, desired, settings["mix_art_store_favorites"])
                             if settings["random"]
                             else desired[0]
+                        )
+                        self._update_operation(
+                            "selecting",
+                            f"Selecting {initial.get('filename', initial['content_id'])}",
+                            initial.get("source_rel"),
                         )
                         try:
                             self._check_ready(art)
@@ -532,25 +885,36 @@ class FrameService:
             manifest = self._require_manifest()
             if content_id not in {entry["content_id"] for entry in manifest["entries"]}:
                 raise ServiceError("preview is limited to images in the currently synced set")
-            art = self._art()
-            self._check_ready(art)
-            try:
-                current = art.get_current()
-                restore_id = self._current_id(current)
-            except Exception as exc:
-                raise ServiceError(f"could not read the current TV image: {exc}") from exc
-            if restore_id is None:
-                raise ServiceError("TV did not identify its current image; preview was not started")
-            try:
-                art.select_image(content_id)
-            except Exception as exc:
-                raise ServiceError(f"TV could not display the preview: {exc}") from exc
-            self._preview_restore_id = restore_id
-            self._preview_restore_category = self._current_category(current)
-            self._preview_until = self.clock() + 15
-            self._current_content_id = content_id
+        self._begin_operation("preview", "checking-tv", "Checking TV before preview")
+        try:
+            with self._lock:
+                manifest = self._require_manifest()
+                if content_id not in {entry["content_id"] for entry in manifest["entries"]}:
+                    raise ServiceError("preview is limited to images in the currently synced set")
+                art = self._art()
+                self._check_ready(art)
+                try:
+                    current = art.get_current()
+                    restore_id = self._current_id(current)
+                except Exception as exc:
+                    raise ServiceError(f"could not read the current TV image: {exc}") from exc
+                if restore_id is None:
+                    raise ServiceError("TV did not identify its current image; preview was not started")
+                self._update_operation("selecting-preview", "Selecting preview image", content_id)
+                try:
+                    art.select_image(content_id)
+                except Exception as exc:
+                    raise ServiceError(f"TV could not display the preview: {exc}") from exc
+                self._preview_restore_id = restore_id
+                self._preview_restore_category = self._current_category(current)
+                self._preview_until = self.clock() + 15
+                self._current_content_id = content_id
+        except Exception as exc:
+            self._finish_operation("failed", str(exc), "preview")
+            raise
 
     def _restore_preview(self, art: Any, now: float, active_set: str) -> None:
+        self._update_operation("restoring-preview", "Restoring the previous TV image")
         self._select_image(
             art,
             {"content_id": self._preview_restore_id, "category": self._preview_restore_category},
@@ -561,13 +925,22 @@ class FrameService:
         self._preview_until = None
         self._clear_cycle_error("preview restore paused:")
         self._next_at = now + self.settings_for(active_set)["interval_minutes"] * 60
+        self._finish_operation(
+            "completed", "Preview ended and previous image was restored", "preview"
+        )
 
     def _cycle(self) -> None:
         while not self._stop.is_set():
             with self._lock:
                 manifest = self._manifest
                 entries = manifest.get("entries", []) if manifest else []
-                if self._syncing or self._manifest_error or not entries:
+                operation = self._current_operation()
+                if (
+                    self._syncing
+                    or (operation is not None and operation.get("kind") != "preview")
+                    or self._manifest_error
+                    or not entries
+                ):
                     self._stop.wait(1)
                     continue
                 now = self.clock()
@@ -576,12 +949,18 @@ class FrameService:
                         self._stop.wait(min(1, self._preview_until - now))
                         continue
                     try:
+                        self._update_operation(
+                            "checking-tv", "Checking TV before restoring preview"
+                        )
                         art = self._art()
                         self._check_ready(art)
                         self._restore_preview(art, now, manifest["active_set"])
                     except Exception as exc:
                         self._tv_ready = False
                         self._last_error = f"preview restore paused: {exc}"
+                        self._update_operation(
+                            "restore-failed", f"Preview restore paused: {exc}"
+                        )
                         self._stop.wait(5)
                         continue
                 if self._paused_remaining is not None:
@@ -599,6 +978,9 @@ class FrameService:
                     self._stop.wait(min(1, self._next_at - now))
                     continue
                 try:
+                    self._begin_operation(
+                        "slideshow-selection", "checking-tv", "Checking TV before selection"
+                    )
                     art = self._art()
                     self._check_ready(art)
                     settings = self.settings_for(manifest["active_set"])
@@ -610,6 +992,10 @@ class FrameService:
                             -1,
                         )
                         selected = entries[(index + 1) % len(entries)]
+                    self._update_operation(
+                        "selecting", f"Selecting {selected.get('filename', selected['content_id'])}",
+                        selected.get("source_rel"),
+                    )
                     self._select_image(art, selected)
                     self._current_content_id = selected["content_id"]
                     updated = dict(manifest)
@@ -617,12 +1003,17 @@ class FrameService:
                     self._write_manifest(updated)
                     self._next_at = self.clock() + settings["interval_minutes"] * 60
                     self._clear_cycle_error("cycling paused:")
+                    self._finish_operation(
+                        "completed", "Slideshow image selected", "slideshow-selection"
+                    )
                 except ServiceError as exc:
                     self._last_error = f"cycling paused: {exc}"
                     self._paused_remaining = max(0, self._next_at - self.clock())
+                    self._finish_operation("failed", str(exc), "slideshow-selection")
                 except Exception as exc:
                     self._last_error = f"cycling paused: {exc}"
                     self._paused_remaining = max(0, self._next_at - self.clock())
+                    self._finish_operation("failed", str(exc), "slideshow-selection")
             self._stop.wait(1)
 
     def start(self) -> None:
@@ -636,11 +1027,28 @@ class FrameService:
         self._stop.set()
         if self._thread:
             self._thread.join(timeout=35)
-        if (not self._thread or not self._thread.is_alive()) and not self._lock_file.closed:
+        if self._operation_thread:
+            self._operation_thread.join(timeout=35)
+        if (
+            (not self._thread or not self._thread.is_alive())
+            and (not self._operation_thread or not self._operation_thread.is_alive())
+            and not self._lock_file.closed
+        ):
             self._lock_file.close()
 
     def status(self) -> dict[str, Any]:
         manifest = self._manifest or self._empty_manifest()
+        with self._operation_lock:
+            operation = self._operation.get("current")
+            last_result = self._operation.get("last_result")
+            public_operation = (
+                {key: value for key, value in operation.items() if key != "known_uploaded"}
+                if operation else None
+            )
+            public_result = (
+                {key: value for key, value in last_result.items() if key != "recovery_pending"}
+                if last_result else None
+            )
         return {
             "active_set": manifest.get("active_set"),
             "entries": manifest.get("entries", []),
@@ -649,4 +1057,6 @@ class FrameService:
             "tv_ready": self._tv_ready,
             "last_error": self._last_error or self._manifest_error,
             "warnings": list(self._last_warnings),
+            "operation": public_operation,
+            "last_result": public_result,
         }

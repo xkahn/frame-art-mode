@@ -100,6 +100,22 @@ on the next explicit sync. Untracked/pre-existing Samsung art is never deleted;
 accordingly, the service cannot guarantee that outside art is absent from the
 TV's own rotation.
 
+Sync runs in a server-side background operation, so the page stays responsive
+and closing or reloading the browser does not cancel it. The page shows the
+current TV operation, sync phase and file count, current image, and the most
+recent result/error with its timestamp. It refreshes status while an operation
+is active, and performs a one-time reachability check on the initial page load.
+Idle page refreshes query only the service's local status and do not contact the
+TV. Upload progress is indeterminate while the service waits for TV confirmation
+because the Samsung library exposes no byte progress callback.
+
+TV operation status is persisted beside the ownership manifest. If the service
+restarts during sync, it marks the job interrupted without resuming it, keeps
+the last committed active set, and records known partial uploads as
+cleanup-pending. Those known items are reconciled only by the next explicit
+**Sync to TV**; unknown TV content is never inferred or deleted. A timeout ends
+the job and requires the user to retry explicitly.
+
 Sync requires the TV to be reachable and already in Art Mode. The service never
 turns the TV on or changes Art Mode. Automatic cycling pauses when the TV is
 unavailable or leaves Art Mode and resumes when it returns. One running service
