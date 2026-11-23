@@ -1,0 +1,20 @@
+# Glossary
+
+- **Image root**: Configured NAS directory from which source photos are read.
+- **Default set**: Image files directly inside the image root.
+- **Occasion set**: All images recursively below one immediate child directory
+  of the image root.
+- **Active set**: The last set successfully synced and currently selected for
+  automatic cycling.
+- **Pending selection**: The set and playback options currently chosen in the
+  web form; they do not affect the TV until an explicit sync.
+- **Snapshot**: Immutable, sanitized JPEG copies staged outside the image root
+  during one explicit sync.
+- **Managed TV item**: A TV content ID returned/verified during this service's
+  upload and recorded in its per-TV manifest.
+- **Cleanup-pending item**: A previously managed TV item whose deletion failed;
+  it remains recorded for retry on the next explicit sync.
+- **Ownership manifest**: Per-TV durable record of active and cleanup-pending
+  content IDs, source fingerprints, selected set, and per-set playback settings.
+- **Preview**: A temporary selection of an image already in the active set,
+  followed by restoration of the image that had been on screen.

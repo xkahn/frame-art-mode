@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$SCRIPT_DIR"
+exec "$SCRIPT_DIR/.venv/bin/python" -m frame_art_mode.main --config "$SCRIPT_DIR/config.json" "$@"
