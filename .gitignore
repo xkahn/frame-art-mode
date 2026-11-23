@@ -152,6 +152,9 @@ activemq-data/
 # Environments
 .env
 .envrc
+config.json
+/image/
+/state/
 .venv
 env/
 venv/
