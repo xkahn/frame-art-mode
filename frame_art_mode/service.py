@@ -13,6 +13,8 @@ from typing import Any, Callable
 from .config import Config
 from .images import PreparedImage, discover_sets, prepare_set
 
+ART_STORE_FAVORITES_CATEGORY = "MY-C0004"
+
 
 class ServiceError(RuntimeError):
     pass
@@ -70,6 +72,7 @@ class FrameService:
         self._tv_ready: bool | None = None
         self._manifest_error: str | None = None
         self._preview_restore_id: str | None = None
+        self._preview_restore_category: str | None = None
         self._preview_until: float | None = None
         self._current_content_id: str | None = None
         self._next_at = self.clock()
@@ -130,6 +133,7 @@ class FrameService:
                 if (
                     not isinstance(settings, dict)
                     or not isinstance(settings.get("random", True), bool)
+                    or not isinstance(settings.get("mix_art_store_favorites", False), bool)
                     or not isinstance(settings.get("interval_minutes", 15), int)
                     or isinstance(settings.get("interval_minutes", 15), bool)
                     or settings.get("interval_minutes", 15) < 1
@@ -218,19 +222,77 @@ class FrameService:
         settings = self._manifest.get("settings", {}).get(set_id, {})
         return {
             "random": bool(settings.get("random", True)),
+            "mix_art_store_favorites": bool(settings.get("mix_art_store_favorites", False)),
             "interval_minutes": int(settings.get("interval_minutes", 15)),
         }
 
-    def save_settings(self, set_id: str, randomize: bool, interval_minutes: int) -> None:
+    def save_settings(
+        self, set_id: str, randomize: bool, interval_minutes: int, mix_art_store_favorites: bool
+    ) -> None:
         if interval_minutes < 1:
             raise ServiceError("interval must be at least one minute")
         with self._lock:
             manifest = self._require_manifest()
             updated = dict(manifest)
             settings = dict(updated.get("settings", {}))
-            settings[set_id] = {"random": bool(randomize), "interval_minutes": int(interval_minutes)}
+            settings[set_id] = {
+                "random": bool(randomize),
+                "mix_art_store_favorites": bool(mix_art_store_favorites),
+                "interval_minutes": int(interval_minutes),
+            }
             updated["settings"] = settings
             self._write_manifest(updated)
+
+    def _warn_favorites(self, warning: str) -> None:
+        self._last_warnings = [
+            item for item in self._last_warnings if not item.startswith("Art Store favorites:")
+        ]
+        self._last_warnings.append(f"Art Store favorites: {warning}")
+
+    def _random_pick(
+        self, art: Any, entries: list[dict[str, Any]], mix_art_store_favorites: bool
+    ) -> dict[str, Any]:
+        candidates = [dict(entry) for entry in entries]
+        content_ids = {entry["content_id"] for entry in candidates}
+        if mix_art_store_favorites:
+            try:
+                available = art.available(ART_STORE_FAVORITES_CATEGORY)
+                if not isinstance(available, list):
+                    raise ServiceError("TV returned an invalid favorites list")
+            except Exception as exc:
+                self._warn_favorites(f"could not read favorites; using NAS images this turn: {exc}")
+            else:
+                self._last_warnings = [
+                    item
+                    for item in self._last_warnings
+                    if not item.startswith("Art Store favorites:")
+                ]
+                unknown_ids = []
+                for item in available:
+                    if not isinstance(item, dict) or not item.get("content_id"):
+                        continue
+                    content_id = str(item["content_id"])
+                    if content_id in content_ids:
+                        continue
+                    if not content_id.startswith("SAM-"):
+                        unknown_ids.append(content_id)
+                        continue
+                    candidates.append(
+                        {"content_id": content_id, "category": ART_STORE_FAVORITES_CATEGORY}
+                    )
+                    content_ids.add(content_id)
+                if unknown_ids:
+                    self._warn_favorites(
+                        f"skipping IDs without the documented SAM- prefix: {', '.join(unknown_ids)}"
+                    )
+        return self.chooser(candidates)
+
+    @staticmethod
+    def _select_image(art: Any, entry: dict[str, Any]) -> None:
+        if entry.get("category"):
+            art.select_image(entry["content_id"], category=entry["category"])
+        else:
+            art.select_image(entry["content_id"])
 
     def _pace(self, index: int, total: int) -> None:
         if index < total - 1:
@@ -411,10 +473,14 @@ class FrameService:
                     updated["cleanup_pending"] = pending
                     display_error = None
                     if desired:
-                        initial = self.chooser(desired) if settings["random"] else desired[0]
+                        initial = (
+                            self._random_pick(art, desired, settings["mix_art_store_favorites"])
+                            if settings["random"]
+                            else desired[0]
+                        )
                         try:
                             self._check_ready(art)
-                            art.select_image(initial["content_id"])
+                            self._select_image(art, initial)
                             updated["current_content_id"] = initial["content_id"]
                             self._current_content_id = initial["content_id"]
                         except Exception as exc:
@@ -450,6 +516,17 @@ class FrameService:
             return str(content["content_id"])
         return None
 
+    @staticmethod
+    def _current_category(response: Any) -> str | None:
+        if not isinstance(response, dict):
+            return None
+        for item in (response, response.get("content")):
+            if isinstance(item, dict):
+                for key in ("category", "category_id", "categoryId"):
+                    if item.get(key):
+                        return str(item[key])
+        return None
+
     def preview(self, content_id: str) -> None:
         with self._lock:
             manifest = self._require_manifest()
@@ -458,7 +535,8 @@ class FrameService:
             art = self._art()
             self._check_ready(art)
             try:
-                restore_id = self._current_id(art.get_current())
+                current = art.get_current()
+                restore_id = self._current_id(current)
             except Exception as exc:
                 raise ServiceError(f"could not read the current TV image: {exc}") from exc
             if restore_id is None:
@@ -468,8 +546,21 @@ class FrameService:
             except Exception as exc:
                 raise ServiceError(f"TV could not display the preview: {exc}") from exc
             self._preview_restore_id = restore_id
+            self._preview_restore_category = self._current_category(current)
             self._preview_until = self.clock() + 15
             self._current_content_id = content_id
+
+    def _restore_preview(self, art: Any, now: float, active_set: str) -> None:
+        self._select_image(
+            art,
+            {"content_id": self._preview_restore_id, "category": self._preview_restore_category},
+        )
+        self._current_content_id = self._preview_restore_id
+        self._preview_restore_id = None
+        self._preview_restore_category = None
+        self._preview_until = None
+        self._clear_cycle_error("preview restore paused:")
+        self._next_at = now + self.settings_for(active_set)["interval_minutes"] * 60
 
     def _cycle(self) -> None:
         while not self._stop.is_set():
@@ -487,12 +578,7 @@ class FrameService:
                     try:
                         art = self._art()
                         self._check_ready(art)
-                        art.select_image(self._preview_restore_id)
-                        self._current_content_id = self._preview_restore_id
-                        self._preview_restore_id = None
-                        self._preview_until = None
-                        self._clear_cycle_error("preview restore paused:")
-                        self._next_at = now + self.settings_for(manifest["active_set"])["interval_minutes"] * 60
+                        self._restore_preview(art, now, manifest["active_set"])
                     except Exception as exc:
                         self._tv_ready = False
                         self._last_error = f"preview restore paused: {exc}"
@@ -517,14 +603,14 @@ class FrameService:
                     self._check_ready(art)
                     settings = self.settings_for(manifest["active_set"])
                     if settings["random"]:
-                        selected = self.chooser(entries)
+                        selected = self._random_pick(art, entries, settings["mix_art_store_favorites"])
                     else:
                         index = next(
                             (i for i, entry in enumerate(entries) if entry["content_id"] == self._current_content_id),
                             -1,
                         )
                         selected = entries[(index + 1) % len(entries)]
-                    art.select_image(selected["content_id"])
+                    self._select_image(art, selected)
                     self._current_content_id = selected["content_id"]
                     updated = dict(manifest)
                     updated["current_content_id"] = self._current_content_id

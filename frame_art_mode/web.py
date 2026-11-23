@@ -35,10 +35,12 @@ label{display:inline-block;margin:.5rem 1rem .5rem 0}button,select,input{font:in
 {% endfor %}</select></label>
 {% set settings = service.settings_for(selected) %}
 <label><input type="checkbox" name="random" value="1" {% if settings.random %}checked{% endif %}> Random order</label>
+<label><input type="checkbox" name="mix_art_store_favorites" value="1" {% if settings.mix_art_store_favorites %}checked{% endif %}> Mix Art Store favorites</label>
 <label>Minutes per image <input type="number" min="1" name="interval_minutes" value="{{ settings.interval_minutes }}"></label>
 <button formaction="{{ url_for('save_settings') }}">Save settings</button>
 <button type="submit">Sync to TV</button>
 </form>
+<p class="muted">Art Store favorites are used only in random playback. Save settings applies playback preferences immediately; the gallery and previews stay NAS-only.</p>
 {% for warning in scan_warnings %}<p class="notice">{{ warning }}</p>{% endfor %}
 <h2>{{ display_names.get(selected, 'Image set') }} images</h2>
 <p class="muted">Changes on disk are picked up only when you explicitly sync. Hidden items, @eaDir and non-image files are ignored.</p>
@@ -96,7 +98,12 @@ def create_app(service: FrameService) -> Flask:
         set_id = request.form.get("set_id", "root")
         try:
             interval = int(request.form.get("interval_minutes", "15"))
-            service.save_settings(set_id, request.form.get("random") == "1", interval)
+            service.save_settings(
+                set_id,
+                request.form.get("random") == "1",
+                interval,
+                request.form.get("mix_art_store_favorites") == "1",
+            )
             flash("Settings saved.")
         except (ValueError, ServiceError) as exc:
             flash(str(exc))
@@ -107,7 +114,12 @@ def create_app(service: FrameService) -> Flask:
         set_id = request.form.get("set_id", "root")
         try:
             interval = int(request.form.get("interval_minutes", "15"))
-            service.save_settings(set_id, request.form.get("random") == "1", interval)
+            service.save_settings(
+                set_id,
+                request.form.get("random") == "1",
+                interval,
+                request.form.get("mix_art_store_favorites") == "1",
+            )
             service.sync(set_id)
             flash("Sync completed.")
         except (ValueError, ServiceError) as exc:

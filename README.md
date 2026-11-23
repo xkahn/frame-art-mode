@@ -64,10 +64,20 @@ service code; the UI port defaults to 8080.
   folders are included. For example, put party pictures under `image/Party/`.
 - The web page lets you choose a set, choose random or natural relative-path
   order, set a per-image interval (15 minutes by default), and save those
-  settings. A selection does not affect the TV until you press **Sync to TV**.
+  settings. Changing the active image set affects the TV only when you press
+  **Sync to TV**; saved playback preferences apply immediately.
+- **Mix Art Store favorites** is a per-set preference saved immediately with
+  **Save settings**. When enabled with random order, each random pick reads the
+  TV-wide Art Store favorites category and mixes recognized favorites into the
+  NAS candidates. It defaults off; favorites are not queried in sequential
+  mode. IDs without the documented `SAM-` prefix are warned about and skipped;
+  that prefix is a best-effort filter, not a guarantee covering every Art Store
+  item. The favorites stay TV-owned and are never uploaded, deleted, or added to
+  the app's ownership manifest.
 - The UI shows image thumbnails and warnings. **Preview 15 seconds** is offered
   only for a photo in the currently synced set; the service restores the image
-  that was on screen and restarts its normal interval.
+  (including its TV category) that was on screen and restarts its normal
+  interval. The gallery and previews remain NAS-only.
 - Add/remove/replace NAS files as needed, then sync explicitly to publish the
   new snapshot. The service does not watch folders or queue changes.
 
