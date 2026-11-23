@@ -3,14 +3,32 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import sys
 from pathlib import Path
 
-from .config import load_config
-from .service import FrameService
-from .web import create_app
+
+def require_supported_python(version_info=None) -> None:
+    version_info = sys.version_info if version_info is None else version_info
+    if version_info < (3, 10):
+        major = version_info[0]
+        minor = version_info[1]
+        raise RuntimeError(
+            f"Python 3.10 or later is required (detected {major}.{minor}). "
+            "Recreate .venv with Python 3.11 or newer; do not reuse a Python 3.8 venv."
+        )
 
 
 def main() -> None:
+    try:
+        require_supported_python()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+
+    from .config import load_config
+    from .service import FrameService
+    from .web import create_app
+
     script_dir = Path(__file__).resolve().parent.parent
     parser = argparse.ArgumentParser(description="Manage personal art on a Samsung The Frame TV.")
     parser.add_argument("--config", type=Path, default=script_dir / "config.json")
