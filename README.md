@@ -12,13 +12,19 @@ recorded in its per-TV ownership manifest.
 
 ## Install on Synology DSM 7
 
-1. Install Python 3.11 or later through DSM Package Center (or another supported
-   Synology Python package) and place this repository in a persistent folder.
-2. Create and populate a local virtual environment:
+1. Install Python 3.11 through DSM Package Center (or another supported
+   Synology Python 3.11 package) and place this repository in a persistent folder.
+   Python 3.10 or later is the minimum, but Python 3.11 is required by these startup
+   instructions. Samsung TV library releases 4.0 through 4.1.4 require Python
+   3.10 or later; Python 3.8 cannot resolve or install them.
+2. Create a fresh local virtual environment with Python 3.11. Do not reuse an
+   existing `.venv` created by Python 3.8. If `.venv` already exists, rename or
+   remove it, then recreate it:
 
    ```sh
    cd /volume1/applications/frame-art-mode
-   python3 -m venv .venv
+   python3.11 -m venv .venv
+   .venv/bin/python --version
    .venv/bin/python -m pip install --upgrade pip
    .venv/bin/python -m pip install -r requirements.txt
    cp config.example.json config.json
