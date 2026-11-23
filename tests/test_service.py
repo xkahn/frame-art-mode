@@ -7,7 +7,7 @@ from pathlib import Path
 from PIL import Image
 
 from frame_art_mode.config import Config
-from frame_art_mode.service import FrameService, ServiceError
+from frame_art_mode.service import ART_STORE_FAVORITES_CATEGORY, FrameService, ServiceError
 from frame_art_mode.web import create_app
 
 
@@ -27,13 +27,22 @@ class FakeArt:
         self.mode = "on"
         self.current = None
         self.calls = []
+        self.favorites = []
+        self.fail_favorites = False
+        self.current_category = None
         self.return_none = False
         self.on_upload = None
 
     def get_artmode(self):
         return self.mode
 
-    def available(self):
+    def available(self, category=None):
+        self.calls.append(("available", category))
+        if category == ART_STORE_FAVORITES_CATEGORY:
+            if self.fail_favorites:
+                self.fail_favorites = False
+                raise RuntimeError("favorites unavailable")
+            return list(self.favorites)
         return [{"content_id": content_id} for content_id in self.items]
 
     def upload(self, data, file_type):
@@ -56,12 +65,13 @@ class FakeArt:
         self.items.pop(content_id, None)
         return True
 
-    def select_image(self, content_id):
+    def select_image(self, content_id, category=None):
         self.current = content_id
-        self.calls.append(("select", content_id))
+        self.current_category = category
+        self.calls.append(("select", content_id, category))
 
     def get_current(self):
-        return {"content_id": self.current}
+        return {"content_id": self.current, "category": self.current_category}
 
 
 class SyncTests(unittest.TestCase):
@@ -251,13 +261,98 @@ class SyncTests(unittest.TestCase):
             csrf = browser_session["csrf_token"]
         response = client.post(
             "/settings",
-            data={"set_id": "root", "interval_minutes": "7", "random": "1", "csrf_token": csrf},
+            data={
+                "set_id": "root",
+                "interval_minutes": "7",
+                "random": "1",
+                "mix_art_store_favorites": "1",
+                "csrf_token": csrf,
+            },
         )
         self.assertEqual(response.status_code, 302)
         self.assertEqual(self.service.settings_for("root")["interval_minutes"], 7)
+        self.assertTrue(self.service.settings_for("root")["mix_art_store_favorites"])
         encoded = base64.urlsafe_b64encode(b"photo.jpg").decode().rstrip("=")
         thumbnail = client.get(f"/thumbnail/{encoded}")
         self.assertEqual(thumbnail.mimetype, "image/jpeg")
+
+    def test_art_store_favorites_setting_defaults_off_and_saves_per_set(self):
+        occasion = self.images / "Party"
+        occasion.mkdir()
+        self.assertFalse(self.service.settings_for("root")["mix_art_store_favorites"])
+        self.assertFalse(self.service.settings_for("occasion:Party")["mix_art_store_favorites"])
+
+        self.service.save_settings("occasion:Party", True, 9, True)
+
+        self.assertTrue(self.service.settings_for("occasion:Party")["mix_art_store_favorites"])
+        self.assertFalse(self.service.settings_for("root")["mix_art_store_favorites"])
+
+    def test_random_pick_mixes_filtered_favorites_and_deduplicates_nas_ids(self):
+        self.art.favorites = [
+            {"content_id": "SAM-ART-1"},
+            {"content_id": "APP-1"},
+            {"content_id": "UNKNOWN-ART"},
+        ]
+        picked = []
+        self.service.chooser = lambda candidates: (
+            picked.extend(candidates) or next(
+                item for item in candidates if item.get("category") == ART_STORE_FAVORITES_CATEGORY
+            )
+        )
+        self.service.save_settings("root", True, 15, True)
+
+        self.service.sync("root")
+
+        self.assertEqual(
+            [item["content_id"] for item in picked],
+            ["APP-1", "SAM-ART-1"],
+        )
+        self.assertEqual(self.art.current, "SAM-ART-1")
+        self.assertEqual(self.art.current_category, ART_STORE_FAVORITES_CATEGORY)
+        self.assertTrue(any("UNKNOWN-ART" in warning for warning in self.service.status()["warnings"]))
+        self.assertIn(("available", ART_STORE_FAVORITES_CATEGORY), self.art.calls)
+
+    def test_favorites_are_not_queried_when_random_mode_is_off(self):
+        self.service.save_settings("root", False, 15, True)
+
+        self.service.sync("root")
+
+        self.assertFalse(any(call == ("available", ART_STORE_FAVORITES_CATEGORY) for call in self.art.calls))
+        self.assertIsNone(self.art.current_category)
+
+    def test_empty_favorites_and_query_errors_fall_back_then_retry_next_pick(self):
+        nas_entry = {"content_id": "APP-1"}
+        self.service.chooser = lambda candidates: candidates[0]
+        self.art.favorites = []
+
+        self.assertEqual(self.service._random_pick(self.art, [nas_entry], True), nas_entry)
+
+        self.art.fail_favorites = True
+        self.assertEqual(self.service._random_pick(self.art, [nas_entry], True), nas_entry)
+        self.assertTrue(any("favorites unavailable" in item for item in self.service.status()["warnings"]))
+
+        self.art.favorites = [{"content_id": "SAM-ART-2"}]
+        retry = self.service._random_pick(self.art, [nas_entry], True)
+
+        self.assertEqual(retry, nas_entry)
+        self.assertEqual(
+            sum(call == ("available", ART_STORE_FAVORITES_CATEGORY) for call in self.art.calls),
+            3,
+        )
+        self.assertFalse(any("favorites unavailable" in item for item in self.service.status()["warnings"]))
+
+    def test_manual_preview_restores_previous_favorite_category_and_resets_timer(self):
+        self.service.sync("root")
+        self.art.current = "SAM-ART-RESTORE"
+        self.art.current_category = ART_STORE_FAVORITES_CATEGORY
+
+        self.service.preview(self.service.status()["entries"][0]["content_id"])
+        self.service._restore_preview(self.art, 100, "root")
+
+        self.assertEqual(self.art.current, "SAM-ART-RESTORE")
+        self.assertEqual(self.art.current_category, ART_STORE_FAVORITES_CATEGORY)
+        self.assertEqual(self.service._next_at, 100 + 15 * 60)
+        self.assertIsNone(self.service._preview_restore_category)
 
     def test_gallery_long_filenames_wrap_and_keep_full_title(self):
         filename = "a" * 100 + ".jpg"

@@ -8,6 +8,12 @@
   automatic cycling.
 - **Pending selection**: The set and playback options currently chosen in the
   web form; they do not affect the TV until an explicit sync.
+- **Mix Art Store favorites**: Per-set preference to include recognized
+  TV-owned favorites in random playback; disabled by default and unused when
+  sequential playback is selected.
+- **Art Store favorite**: TV-owned content returned from category `MY-C0004`.
+  This service only reads and selects it. It is not part of the NAS gallery or
+  ownership manifest; IDs without the documented `SAM-` prefix are skipped.
 - **Snapshot**: Immutable, sanitized JPEG copies staged outside the image root
   during one explicit sync.
 - **Managed TV item**: A TV content ID returned/verified during this service's
