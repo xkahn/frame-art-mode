@@ -2,8 +2,9 @@
 
 Frame Art Mode is a small web service for managing personal art on one Samsung
 The Frame TV from a Synology NAS. It uses
-[NickWaterton/samsung-tv-ws-api](https://github.com/NickWaterton/samsung-tv-ws-api)
-(published on PyPI as `samsungframetv`).
+[NickWaterton/samsung-tv-ws-api](https://github.com/NickWaterton/samsung-tv-ws-api),
+pinned here to upstream release `4.1.4` (also published on PyPI as
+`samsungframetv`).
 
 The service reads photos from NAS folders, creates safe JPEG copies, and uploads
 the selected set only when you press **Sync to TV**. It never edits originals,
@@ -12,8 +13,10 @@ recorded in its per-TV ownership manifest.
 
 ## Install on Synology DSM 7
 
-1. Install Python 3.11 or later through DSM Package Center (or another supported
+1. Install Python 3.10 or later through DSM Package Center (or another supported
    Synology Python package) and place this repository in a persistent folder.
+   Python 3.11 or later is recommended. Samsung TV library releases 4.0 through
+   4.1.4 require Python 3.10 or later; Python 3.8 cannot resolve or install them.
 2. Create and populate a local virtual environment:
 
    ```sh
@@ -23,6 +26,14 @@ recorded in its per-TV ownership manifest.
    .venv/bin/python -m pip install -r requirements.txt
    cp config.example.json config.json
    ```
+
+   The TV library is pinned to upstream release tag `4.1.4` through Git instead
+   of relying on a Synology, corporate, or other private package mirror to carry
+   the package. The NAS and its Python environment must allow HTTPS GitHub
+   access during installation. Verify the source interpreter first with
+   `.venv/bin/python --version`; it must report 3.10 or newer. If GitHub access
+   is unavailable, configure your private mirror to include the public
+   `samsungframetv==4.1.4` package or use a separately vendored wheel.
 
 3. Edit `config.json` with the TV's reserved LAN IP, a specific LAN IP assigned
    to the NAS, and the image and state directories. The `state_dir` must be

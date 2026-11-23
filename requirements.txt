@@ -1,4 +1,4 @@
 Flask>=3.0,<4
 Pillow>=10.0
 Unidecode>=1.3
-samsungframetv>=4.0
+samsungframetv @ git+https://github.com/NickWaterton/samsung-tv-ws-api.git@4.1.4
