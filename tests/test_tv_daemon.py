@@ -1950,6 +1950,271 @@ class TVDaemonTests(unittest.TestCase):
         # Re-create self.daemon so tearDown cleanly succeeds
         self.daemon = self._make_daemon()
 
+    def _seed_active_one_image_manifest(self) -> None:
+        self.daemon.start_sync("root")
+        deadline = time.monotonic() + 5.0
+        while self.daemon.status()["operation"] is not None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.daemon.status()["last_result"]["state"], "completed")
+
+    def test_wait_for_response_enforces_deadline_on_unsolicited_events(self):
+        self._seed_active_one_image_manifest()
+        self.daemon.stop()
+
+        class _StubConn:
+            def __init__(self) -> None:
+                self.connected = True
+                self.timeout = 30.0
+                self.timeouts_set: list[float | None] = []
+
+            def gettimeout(self) -> float | None:
+                return self.timeout
+
+            def settimeout(self, value: float | None) -> None:
+                self.timeout = value
+                self.timeouts_set.append(value)
+
+        class _NoisyArtClient(FakeArtClient):
+            def __init__(self, clock: FakeClock) -> None:
+                super().__init__()
+                self._clock = clock
+                self.connection = _StubConn()
+                self.msg_calls = 0
+
+            def get_websocket_message(self) -> dict:
+                self.msg_calls += 1
+                self._clock.advance(2.5)
+                return {"event": "ms.channel.ping", "request_id": "unsolicited"}
+
+            def wait_for_response(self, wait_for_event, request_uuid=None, or_no_id=False):
+                raise AssertionError("unwrapped wait_for_response must not be called")
+
+            def select_image(self, content_id: str, category: str | None = None, show: bool = True):
+                self.calls.append(("select", content_id, category))
+                return self.wait_for_response(None, "req-select")
+
+        noisy_client = _NoisyArtClient(self.clock)
+        daemon = TVDaemon(
+            self.config,
+            tv_factory=lambda _c, _t: noisy_client,
+            library_caller=self.library,
+            sleeper=self.sleeps.append,
+            clock=self.clock.monotonic,
+            wall_clock=self.clock.utcnow,
+        )
+        try:
+            ok = daemon.run_slideshow_tick()
+            self.assertFalse(ok)
+            status = daemon.status()
+            self.assertIsNone(status["operation"])
+            self.assertEqual(status["last_result"]["state"], "failed")
+            self.assertIn("timed out", status["last_error"])
+            self.assertTrue(status["cycling_paused"])
+            self.assertTrue(noisy_client.closed)
+            # Timeout failure must fail fast without probing get_artmode() a second time
+            artmode_calls = [c for c in noisy_client.calls if c[0] == "get_artmode"]
+            self.assertEqual(len(artmode_calls), 1)
+            self.assertEqual(noisy_client.connection.timeout, 30.0)
+        finally:
+            daemon.stop()
+            self.daemon = self._make_daemon()
+
+    def test_wait_for_response_detects_empty_eof_spin_and_closed_socket(self):
+        self._seed_active_one_image_manifest()
+        self.daemon.stop()
+
+        class _StubConn:
+            def __init__(self, connected: bool) -> None:
+                self.connected = connected
+                self.timeout = 30.0
+
+            def gettimeout(self) -> float | None:
+                return self.timeout
+
+            def settimeout(self, value: float | None) -> None:
+                self.timeout = value
+
+        class _EofArtClient(FakeArtClient):
+            def __init__(self, connected: bool, *, close_on_read: bool = False) -> None:
+                super().__init__()
+                self.connection = _StubConn(connected=connected)
+                self.close_on_read = close_on_read
+                self.msg_calls = 0
+
+            def get_websocket_message(self) -> dict:
+                self.msg_calls += 1
+                if self.close_on_read:
+                    self.connection.connected = False
+                return {}
+
+            def wait_for_response(self, wait_for_event, request_uuid=None, or_no_id=False):
+                raise AssertionError("unwrapped wait_for_response must not be called")
+
+            def select_image(self, content_id: str, category: str | None = None, show: bool = True):
+                self.calls.append(("select", content_id, category))
+                return self.wait_for_response(None, "req-eof")
+
+        cases = (
+            ("already_closed", False, False, 0),
+            ("closed_mid_read", True, True, 1),
+            ("empty_spin", True, False, 50),
+        )
+        for label, connected, close_on_read, expected_calls in cases:
+            with self.subTest(case=label):
+                eof_client = _EofArtClient(connected=connected, close_on_read=close_on_read)
+                daemon = TVDaemon(
+                    self.config,
+                    tv_factory=lambda _c, _t: eof_client,
+                    library_caller=self.library,
+                    sleeper=self.sleeps.append,
+                    clock=self.clock.monotonic,
+                    wall_clock=self.clock.utcnow,
+                )
+                try:
+                    self.assertFalse(daemon.run_slideshow_tick())
+                    self.assertEqual(eof_client.msg_calls, expected_calls)
+                    self.assertTrue(eof_client.closed)
+                    status = daemon.status()
+                    self.assertIsNone(status["operation"])
+                    self.assertEqual(status["last_result"]["state"], "failed")
+                    self.assertIn("closed", status["last_error"])
+                finally:
+                    daemon.stop()
+        self.daemon = self._make_daemon()
+
+    def test_abort_wakes_blocked_select_image_and_preview_restore_still_completes(self):
+        self._seed_active_one_image_manifest()
+        self.daemon.stop()
+
+        class WebSocketTimeoutException(Exception):
+            pass
+
+        class _StubConn:
+            def __init__(self) -> None:
+                self.connected = True
+                self.timeout = 30.0
+                self.timeouts_set: list[float | None] = []
+
+            def gettimeout(self) -> float | None:
+                return self.timeout
+
+            def settimeout(self, value: float | None) -> None:
+                self.timeout = value
+                self.timeouts_set.append(value)
+
+        class _BlockingSelectClient(FakeArtClient):
+            def __init__(self, daemon_ref_holder: list[TVDaemon]) -> None:
+                super().__init__()
+                self.connection = _StubConn()
+                self._daemon_ref_holder = daemon_ref_holder
+                self.select_entered = threading.Event()
+                self.timeouts_seen = 0
+
+            def get_websocket_message(self) -> dict:
+                self.timeouts_seen += 1
+                if self.timeouts_seen == 1:
+                    self.select_entered.set()
+                    # Wait briefly until abort is triggered, then raise socket slice timeout
+                    time.sleep(0.05)
+                raise WebSocketTimeoutException("timed out slice")
+
+            def wait_for_response(self, wait_for_event, request_uuid=None, or_no_id=False):
+                raise AssertionError("unwrapped wait_for_response must not be called")
+
+            def select_image(self, content_id: str, category: str | None = None, show: bool = True):
+                self.calls.append(("select", content_id, category))
+                return self.wait_for_response(None, "req-block")
+
+        holder: list[TVDaemon] = []
+        blocking_client = _BlockingSelectClient(holder)
+        daemon = TVDaemon(
+            self.config,
+            tv_factory=lambda _c, _t: blocking_client,
+            library_caller=self.library,
+            clock=self.clock.monotonic,
+            wall_clock=self.clock.utcnow,
+        )
+        holder.append(daemon)
+        try:
+            tick_result: list[bool] = []
+            tick_done = threading.Event()
+
+            def _run_tick() -> None:
+                tick_result.append(daemon.run_slideshow_tick())
+                tick_done.set()
+
+            thread = threading.Thread(target=_run_tick, daemon=True)
+            thread.start()
+            self.assertTrue(blocking_client.select_entered.wait(timeout=2.0))
+            abort_resp = daemon.request_abort()
+            self.assertTrue(abort_resp["aborted"])
+            self.assertTrue(tick_done.wait(timeout=2.0), "slideshow tick deadlocked on abort")
+            self.assertEqual(tick_result, [False])
+            self.assertTrue(blocking_client.closed)
+            status = daemon.status()
+            self.assertIsNone(status["operation"])
+            self.assertEqual(status["last_result"]["state"], "aborted")
+            self.assertTrue(
+                any(t is not None and t <= 1.0 for t in blocking_client.connection.timeouts_set)
+            )
+            self.assertEqual(blocking_client.connection.timeout, 30.0)
+        finally:
+            daemon.stop()
+
+        # Verify aborting a preview wait still runs restore_art.wait_for_response() to completion
+        class _PreviewRestoreClient(FakeArtClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.current = "APP-1"
+                self.connection = _StubConn()
+                self.msg_calls = 0
+
+            def get_websocket_message(self) -> dict:
+                self.msg_calls += 1
+                return {"request_id": f"req-{self.msg_calls}", "event": "ok"}
+
+            def wait_for_response(self, wait_for_event, request_uuid=None, or_no_id=False):
+                raise AssertionError("unwrapped wait_for_response must not be called")
+
+            def select_image(self, content_id: str, category: str | None = None, show: bool = True):
+                req_id = f"req-{self.msg_calls + 1}"
+                self.calls.append(("select", content_id, category))
+                self.wait_for_response(None, req_id)
+                self.current = content_id
+                self.current_category = category
+                return True
+
+        preview_clients: list[_PreviewRestoreClient] = []
+
+        def _preview_factory(_c: Config, _t: Path) -> _PreviewRestoreClient:
+            c = _PreviewRestoreClient()
+            preview_clients.append(c)
+            return c
+
+        preview_daemon = TVDaemon(self.config, tv_factory=_preview_factory)
+        preview_daemon.start()
+        try:
+            preview_daemon.start_preview("APP-1")
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                op = preview_daemon.status()["operation"]
+                if op and op["phase"] == "previewing":
+                    break
+                time.sleep(0.01)
+            self.assertTrue(preview_daemon.request_abort()["aborted"])
+            deadline = time.monotonic() + 3.0
+            while preview_daemon.status()["operation"] is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            st = preview_daemon.status()
+            self.assertIsNone(st["operation"])
+            self.assertEqual(st["last_result"]["state"], "aborted")
+            self.assertIn("restored", st["last_result"]["message"])
+            self.assertEqual(len(preview_clients), 2)
+            self.assertTrue(all(c.closed for c in preview_clients))
+        finally:
+            preview_daemon.stop()
+            self.daemon = self._make_daemon()
+
 
 if __name__ == "__main__":
     unittest.main()

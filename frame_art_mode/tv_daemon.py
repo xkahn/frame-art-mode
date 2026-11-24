@@ -106,6 +106,130 @@ class _NotFoundError(TVServiceError):
         self.code = code
 
 
+def _is_timeout_exception(exc: BaseException) -> bool:
+    return isinstance(exc, TimeoutError) or type(exc).__name__ in {
+        "TimeoutError",
+        "WebSocketTimeoutException",
+    }
+
+
+def _is_timeout_or_connection_error(exc: BaseException) -> bool:
+    return isinstance(exc, (TimeoutError, ConnectionError)) or type(exc).__name__ in {
+        "TimeoutError",
+        "WebSocketTimeoutException",
+        "WebSocketConnectionClosedException",
+        "ConnectionFailure",
+    }
+
+
+def _extract_art_error_request(data: dict[str, Any]) -> str:
+    raw = data.get("request_data")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            parsed = {}
+        if isinstance(parsed, dict) and parsed.get("request"):
+            return str(parsed["request"])
+    elif isinstance(raw, dict) and raw.get("request"):
+        return str(raw["request"])
+    return "art"
+
+
+def _install_wait_deadline_guard(
+    art: Any,
+    *,
+    timeout_seconds: float,
+    should_abort: Callable[[], bool],
+    clock: Callable[[], float],
+) -> None:
+    """Wrap SamsungTVArt.wait_for_response with a hard deadline and abort/EOF checks."""
+    if getattr(art, "_wait_deadline_guarded", False):
+        return
+    original_wait = getattr(art, "wait_for_response", None)
+    get_msg = getattr(art, "get_websocket_message", None)
+    if not callable(original_wait) or not callable(get_msg):
+        return
+
+    def guarded_wait_for_response(
+        wait_for_event: str | None,
+        request_uuid: str | None = None,
+        or_no_id: bool = False,
+    ) -> dict[str, Any] | None:
+        deadline = clock() + float(timeout_seconds)
+        conn = getattr(art, "connection", None)
+        has_original_timeout = False
+        original_timeout: float | None = None
+        if conn is not None and hasattr(conn, "gettimeout"):
+            try:
+                original_timeout = conn.gettimeout()
+                has_original_timeout = True
+            except Exception:
+                has_original_timeout = False
+
+        empty_count = 0
+        try:
+            while True:
+                if should_abort() and wait_for_event != "image_added":
+                    raise AbortRequested("operation aborted by user")
+                remaining = deadline - clock()
+                if remaining <= 0:
+                    raise TimeoutError(f"TV response timed out after {timeout_seconds:.1f}s")
+
+                conn = getattr(art, "connection", None)
+                if conn is not None and getattr(conn, "connected", True) is False:
+                    raise ConnectionError("TV WebSocket connection closed")
+                if conn is not None and hasattr(conn, "settimeout"):
+                    try:
+                        conn.settimeout(min(remaining, 1.0))
+                    except Exception as exc:
+                        raise ConnectionError(f"TV WebSocket connection unavailable: {exc}") from exc
+
+                try:
+                    data = get_msg()
+                except Exception as exc:
+                    if _is_timeout_exception(exc):
+                        if should_abort() and wait_for_event != "image_added":
+                            raise AbortRequested("operation aborted by user") from exc
+                        if clock() >= deadline:
+                            raise TimeoutError(
+                                f"TV response timed out after {timeout_seconds:.1f}s"
+                            ) from exc
+                        continue
+                    raise
+
+                if not isinstance(data, dict) or not data:
+                    empty_count += 1
+                    conn = getattr(art, "connection", None)
+                    if (
+                        conn is not None and getattr(conn, "connected", True) is False
+                    ) or empty_count >= 50:
+                        raise ConnectionError("TV WebSocket connection closed")
+                    continue
+
+                empty_count = 0
+                message_uuid = data.get("request_id", data.get("id"))
+                if message_uuid == request_uuid or (or_no_id and message_uuid is None):
+                    sub_event = data.get("event", "*")
+                    if sub_event == "error":
+                        request_name = _extract_art_error_request(data)
+                        raise TVServiceError(
+                            f"{request_name} request failed with error number "
+                            f"{data.get('error_code')}"
+                        )
+                    if not wait_for_event or sub_event == wait_for_event:
+                        return data
+        finally:
+            if has_original_timeout and conn is not None and hasattr(conn, "settimeout"):
+                try:
+                    conn.settimeout(original_timeout)
+                except Exception:
+                    pass
+
+    art.wait_for_response = guarded_wait_for_response
+    art._wait_deadline_guarded = True
+
+
 def default_tv_factory(config: Config, token_file: Path) -> TVArtClient:
     """Create a fresh Samsung Frame TV art client for a single TV operation."""
     from samsungframetv import SamsungTVWS
@@ -197,6 +321,7 @@ class TVDaemon:
 
             self._current_display = self._initial_current_display()
             self._preview_active = False
+            self._restoring_preview = False
             self._preview_content_id: str | None = None
             self._preview_expires_at: str | None = None
 
@@ -649,8 +774,22 @@ class TVDaemon:
     # TV Helpers
     # ------------------------------------------------------------------
 
+    def _should_abort_tv_wait(self) -> bool:
+        if self._stop_event.is_set():
+            return True
+        if self._restoring_preview:
+            return False
+        return self._abort_event.is_set()
+
     def _open_tv(self) -> TVArtClient:
-        return self._tv_factory(self.config, self.token_file)
+        art = self._tv_factory(self.config, self.token_file)
+        _install_wait_deadline_guard(
+            art,
+            timeout_seconds=self.config.tv_timeout_seconds,
+            should_abort=self._should_abort_tv_wait,
+            clock=self._clock,
+        )
+        return art
 
     @staticmethod
     def _is_art_mode(value: Any) -> bool:
@@ -659,6 +798,8 @@ class TVDaemon:
     def _check_ready(self, art: TVArtClient) -> None:
         try:
             ready = self._is_art_mode(art.get_artmode())
+        except AbortRequested:
+            raise
         except Exception as exc:
             with self._state_lock:
                 self._tv_ready = False
@@ -830,6 +971,8 @@ class TVDaemon:
             available = art.available(ART_STORE_FAVORITES_CATEGORY)
             if not isinstance(available, list):
                 raise TVServiceError("TV returned an invalid favorites list")
+        except AbortRequested:
+            raise
         except Exception as exc:
             self._set_favorites_warning(
                 f"could not read favorites; using NAS images this turn: {exc}"
@@ -1016,6 +1159,8 @@ class TVDaemon:
             self._check_ready(art)
             try:
                 current_raw = art.get_current()
+            except AbortRequested:
+                raise
             except Exception as exc:
                 logger.debug("Ignoring get_current() failure during check: %s", exc)
             else:
@@ -1033,6 +1178,14 @@ class TVDaemon:
             self._finish_operation(
                 "completed",
                 "TV is reachable and in Art Mode",
+                kind="reachability",
+                preserve_previous_result=True,
+            )
+        except AbortRequested as exc:
+            error_msg = str(exc) or "Check TV aborted"
+            self._finish_operation(
+                "aborted",
+                error_msg,
                 kind="reachability",
                 preserve_previous_result=True,
             )
@@ -1662,6 +1815,8 @@ class TVDaemon:
             self._check_ready(art)
             try:
                 self._select_candidate(art, selected)
+            except AbortRequested:
+                raise
             except Exception as exc:
                 try:
                     still_ready = self._is_art_mode(art.get_artmode())
@@ -1723,6 +1878,9 @@ class TVDaemon:
                     result = art.delete(cid)
                     if result is not True and cid in self._content_ids(art.available()):
                         raise TVServiceError("TV did not confirm deletion")
+                except AbortRequested:
+                    delete_aborted = True
+                    break
                 except Exception as exc:
                     delete_error = (
                         f"new set is active; old-item cleanup stopped on {cid}: {exc}"
@@ -1861,6 +2019,8 @@ class TVDaemon:
                 current_raw = art.get_current()
                 restore_id = self._extract_current_id(current_raw)
                 restore_category = self._extract_current_category(current_raw)
+            except AbortRequested:
+                raise
             except Exception as exc:
                 raise TVServiceError(f"could not read the current TV image: {exc}") from exc
             if restore_id is None:
@@ -1878,6 +2038,8 @@ class TVDaemon:
             )
             try:
                 art.select_image(entry.content_id)
+            except AbortRequested:
+                raise
             except Exception as exc:
                 try:
                     still_ready = self._is_art_mode(art.get_artmode())
@@ -1956,6 +2118,7 @@ class TVDaemon:
             total_ops=3,
         )
         restore_art: TVArtClient | None = None
+        self._restoring_preview = True
         try:
             restore_art = self._open_tv()
             self._check_ready(restore_art)
@@ -2019,6 +2182,7 @@ class TVDaemon:
                 self._pause_cycling(error_msg)
             self._finish_operation("failed", error_msg, kind="preview")
         finally:
+            self._restoring_preview = False
             close_tv_client(restore_art)
             self._ensure_token_file_permissions()
 
@@ -2082,8 +2246,12 @@ class TVDaemon:
                     self._select_candidate(art, candidate)
                     selected = candidate
                     break
+                except AbortRequested:
+                    raise
                 except Exception as exc:
                     last_select_error = exc
+                    if _is_timeout_or_connection_error(exc):
+                        raise
                     try:
                         still_ready = self._is_art_mode(art.get_artmode())
                     except Exception as mode_exc:
