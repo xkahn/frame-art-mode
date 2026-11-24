@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import hashlib
 import io
+import logging
 import os
+from pathlib import Path
 import re
 import struct
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageOps
@@ -17,27 +18,76 @@ try:
 except ImportError:
     ImageCms = None
 
-ROOT_SET = "root"
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
-IGNORED_NAMES = {"@eaDir", ".DS_Store"}
+from .models import (
+    NORMALIZATION_VERSION,
+    OCCASION_PREFIX,
+    ROOT_SET,
+    CachedImage,
+    ImageError,
+    PreparedImage,
+    SourceImage,
+    atomic_write_bytes,
+)
+
+logger = logging.getLogger(__name__)
+
+IMAGE_EXTENSIONS = frozenset(
+    {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
+)
+IGNORED_NAMES = frozenset({"@eaDir", ".DS_Store"})
 BACKGROUND = (24, 24, 24)
+MIN_SIDE_PX = 640
+MAX_LONGEST_SIDE_PX = 3840
+MAX_ASPECT_RATIO = 3.5
+DEFAULT_MAX_IMAGE_BYTES = 5242880
+QUALITY_STEPS = (88, 82, 76, 70, 64)
+THUMBNAIL_MAX_SIZE = (360, 240)
+THUMBNAIL_QUALITY = 78
 
-
-class ImageError(ValueError):
-    pass
+__all__ = [
+    "BACKGROUND",
+    "DEFAULT_MAX_IMAGE_BYTES",
+    "IGNORED_NAMES",
+    "IMAGE_EXTENSIONS",
+    "MAX_ASPECT_RATIO",
+    "MAX_LONGEST_SIDE_PX",
+    "MIN_SIDE_PX",
+    "NORMALIZATION_VERSION",
+    "OCCASION_PREFIX",
+    "QUALITY_STEPS",
+    "ROOT_SET",
+    "SRGB_PROFILE",
+    "THUMBNAIL_MAX_SIZE",
+    "THUMBNAIL_QUALITY",
+    "CachedImage",
+    "ImageError",
+    "LegacyPreparedImage",
+    "NormalizedAssets",
+    "PreparedImage",
+    "SourceImage",
+    "discover_sets",
+    "file_signature",
+    "natural_key",
+    "normalize_image",
+    "normalize_image_assets",
+    "prepare_set",
+    "read_verified_source",
+    "safe_filename",
+]
 
 
 @dataclass(frozen=True)
-class SourceImage:
-    path: Path
-    set_id: str
-    source_rel: str
-    name_rel: str
-    signature: tuple[int, int, int, int]
+class NormalizedAssets:
+    tv_bytes: bytes
+    thumb_bytes: bytes
+    fingerprint: str
+    byte_size: int
+    width: int
+    height: int
 
 
 @dataclass(frozen=True)
-class PreparedImage:
+class LegacyPreparedImage:
     source_rel: str
     filename: str
     fingerprint: str
@@ -54,13 +104,21 @@ def _fallback_srgb_profile() -> bytes:
 
     def curve() -> bytes:
         parameters = (2.4, 1 / 1.055, 0.055 / 1.055, 1 / 12.92, 0.04045, 0, 0)
-        return b"para\0\0\0\0" + struct.pack(">H", 4) + b"\0\0" + struct.pack(
-            ">7i", *(_fixed(value) for value in parameters)
+        return (
+            b"para\0\0\0\0"
+            + struct.pack(">H", 4)
+            + b"\0\0"
+            + struct.pack(">7i", *(_fixed(value) for value in parameters))
         )
 
     description_text = b"sRGB IEC61966-2.1\0"
-    description = b"desc\0\0\0\0" + struct.pack(">I", len(description_text)) + description_text
-    description += struct.pack(">IIH", 0, 0, 0) + b"\0" * 68
+    description = (
+        b"desc\0\0\0\0"
+        + struct.pack(">I", len(description_text))
+        + description_text
+        + struct.pack(">IIH", 0, 0, 0)
+        + b"\0" * 68
+    )
     tags = [
         (b"desc", description),
         (b"wtpt", xyz((0.9642, 1.0, 0.8249))),
@@ -103,7 +161,7 @@ if ImageCms is not None:
     SRGB_PROFILE = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
 
 
-def _natural_key(value: str) -> tuple[Any, ...]:
+def natural_key(value: str) -> tuple[Any, ...]:
     parts = tuple(
         (0, int(part)) if part.isdigit() else (1, part.casefold())
         for part in re.split(r"(\d+)", value)
@@ -111,11 +169,22 @@ def _natural_key(value: str) -> tuple[Any, ...]:
     return parts + ((2, value.casefold()), (3, value))
 
 
-def _file_signature(stat: os.stat_result) -> tuple[int, int, int, int]:
-    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns
+_natural_key = natural_key
 
 
-def _ignored(name: str) -> bool:
+def file_signature(stat_result: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+    )
+
+
+_file_signature = file_signature
+
+
+def is_ignored_name(name: str) -> bool:
     return (
         name in IGNORED_NAMES
         or name.startswith(".")
@@ -124,35 +193,53 @@ def _ignored(name: str) -> bool:
     )
 
 
+def read_verified_source(
+    path: Path,
+    expected_signature: tuple[int, int, int, int] | None = None,
+    *,
+    race_message: str = "source changed while reading",
+) -> tuple[bytes, tuple[int, int, int, int]]:
+    before = file_signature(path.stat())
+    if expected_signature is not None and before != expected_signature:
+        raise ImageError(race_message)
+    data = path.read_bytes()
+    after = file_signature(path.stat())
+    if after != before:
+        raise ImageError(race_message)
+    return data, after
+
+
 def discover_sets(root: Path) -> tuple[dict[str, list[SourceImage]], list[str]]:
-    root = root.resolve()
     sets: dict[str, list[SourceImage]] = {ROOT_SET: []}
     warnings: list[str] = []
     try:
-        entries = sorted(os.scandir(root), key=lambda entry: _natural_key(entry.name))
+        resolved_root = root.resolve()
+        entries = sorted(os.scandir(resolved_root), key=lambda entry: natural_key(entry.name))
     except OSError as exc:
         return sets, [f"{root}: {exc}"]
 
     for entry in entries:
-        if _ignored(entry.name):
+        if is_ignored_name(entry.name):
             continue
         try:
             if entry.is_dir(follow_symlinks=True):
-                set_id = f"occasion:{entry.name}"
+                set_id = f"{OCCASION_PREFIX}{entry.name}"
                 sets[set_id] = []
-                _walk_set(Path(entry.path), root, set_id, sets[set_id], warnings)
-            elif entry.is_file(follow_symlinks=True) and Path(entry.name).suffix.casefold() in IMAGE_EXTENSIONS:
-                signature = _file_signature(entry.stat(follow_symlinks=True))
+                _walk_set(Path(entry.path), resolved_root, set_id, sets[set_id], warnings)
+            elif (
+                entry.is_file(follow_symlinks=True)
+                and Path(entry.name).suffix.casefold() in IMAGE_EXTENSIONS
+            ):
+                signature = file_signature(entry.stat(follow_symlinks=True))
+                rel = Path(entry.name).as_posix()
                 sets[ROOT_SET].append(
-                    SourceImage(
-                        Path(entry.path), ROOT_SET, Path(entry.name).as_posix(), Path(entry.name).as_posix(), signature
-                    )
+                    SourceImage(Path(entry.path), ROOT_SET, rel, rel, signature)
                 )
         except OSError as exc:
             warnings.append(f"{entry.path}: {exc}")
 
     for images in sets.values():
-        images.sort(key=lambda image: _natural_key(image.name_rel))
+        images.sort(key=lambda image: natural_key(image.name_rel))
     return sets, warnings
 
 
@@ -168,27 +255,39 @@ def _walk_set(
 
     def visit(path: Path) -> None:
         try:
-            stat = path.stat()
-            identity = (stat.st_dev, stat.st_ino)
+            stat_result = path.stat()
+            identity = (stat_result.st_dev, stat_result.st_ino)
             if identity in visited:
                 return
             visited.add(identity)
-            entries = sorted(os.scandir(path), key=lambda entry: _natural_key(entry.name))
+            entries = sorted(os.scandir(path), key=lambda entry: natural_key(entry.name))
         except OSError as exc:
             warnings.append(f"{path}: {exc}")
             return
+
         for entry in entries:
-            if _ignored(entry.name):
+            if is_ignored_name(entry.name):
                 continue
             try:
                 entry_path = Path(entry.path)
                 if entry.is_dir(follow_symlinks=True):
                     visit(entry_path)
-                elif entry.is_file(follow_symlinks=True) and entry_path.suffix.casefold() in IMAGE_EXTENSIONS:
-                    signature = _file_signature(entry.stat(follow_symlinks=True))
+                elif (
+                    entry.is_file(follow_symlinks=True)
+                    and entry_path.suffix.casefold() in IMAGE_EXTENSIONS
+                ):
+                    signature = file_signature(entry.stat(follow_symlinks=True))
                     relative = Path(os.path.relpath(entry_path, root))
                     name_rel = entry_path.relative_to(directory).as_posix()
-                    images.append(SourceImage(entry_path, set_id, relative.as_posix(), name_rel, signature))
+                    images.append(
+                        SourceImage(
+                            entry_path,
+                            set_id,
+                            relative.as_posix(),
+                            name_rel,
+                            signature,
+                        )
+                    )
             except (OSError, ValueError) as exc:
                 warnings.append(f"{entry.path}: {exc}")
 
@@ -210,26 +309,40 @@ def safe_filename(name_rel: str, used: set[str]) -> str:
     return candidate
 
 
-def normalize_image(data: bytes) -> bytes:
+def _prepare_rgb_image(data: bytes) -> Image.Image:
+    if not data:
+        raise ImageError("image file is empty")
     try:
         with Image.open(io.BytesIO(data)) as original:
             if original.format == "GIF" and getattr(original, "n_frames", 1) != 1:
                 raise ImageError("animated GIFs are not supported")
+            if getattr(original, "is_animated", False) or getattr(original, "n_frames", 1) > 1:
+                raise ImageError(f"animated {original.format or 'image'}s are not supported")
+            embedded_profile = original.info.get("icc_profile")
             original.load()
             image = ImageOps.exif_transpose(original)
             width, height = image.size
-            if width < 640 or height < 640:
-                raise ImageError(f"image is too small ({width}x{height}; both sides must be at least 640px)")
-            if max(width, height) / min(width, height) > 3.5:
+            if width < MIN_SIDE_PX or height < MIN_SIDE_PX:
+                raise ImageError(
+                    f"image is too small ({width}x{height}; both sides must be at least {MIN_SIDE_PX}px)"
+                )
+            if max(width, height) / min(width, height) > MAX_ASPECT_RATIO:
                 raise ImageError(f"aspect ratio exceeds 3.5:1 ({width}x{height})")
+
+            if image.mode.startswith("I;16"):
+                image = image.point(lambda value: value / 256).convert("L")
 
             alpha = None
             if "A" in image.getbands() or "transparency" in image.info:
                 rgba = image.convert("RGBA")
                 alpha = rgba.getchannel("A")
-                image = image.getchannel("L") if image.mode == "LA" else rgba.convert("RGB")
+                if image.mode in {"L", "LA"}:
+                    image = image.getchannel("L")
+                elif image.mode == "1":
+                    image = image.convert("L")
+                else:
+                    image = rgba.convert("RGB")
 
-            embedded_profile = original.info.get("icc_profile")
             if embedded_profile:
                 if ImageCms is None:
                     if embedded_profile != SRGB_PROFILE:
@@ -255,16 +368,22 @@ def normalize_image(data: bytes) -> bytes:
                             image = image.convert("L")
                         elif profile_space in {"LAB", "XYZ"}:
                             if image.mode != profile_space:
-                                raise ImageError(f"{profile_space} profile does not match the image data")
+                                raise ImageError(
+                                    f"{profile_space} profile does not match the image data"
+                                )
                         else:
-                            raise ImageError(f"unsupported embedded profile color space: {profile_space}")
+                            raise ImageError(
+                                f"unsupported embedded profile color space: {profile_space}"
+                            )
                         image = ImageCms.profileToProfile(
                             image, source_profile, target_profile, outputMode="RGB"
                         )
                     except Exception as exc:
                         if isinstance(exc, ImageError):
                             raise
-                        raise ImageError(f"embedded ICC profile cannot be converted: {exc}") from exc
+                        raise ImageError(
+                            f"embedded ICC profile cannot be converted: {exc}"
+                        ) from exc
             else:
                 image = image.convert("RGB")
 
@@ -273,51 +392,112 @@ def normalize_image(data: bytes) -> bytes:
                 rgba.putalpha(alpha)
                 background = Image.new("RGBA", rgba.size, BACKGROUND + (255,))
                 image = Image.alpha_composite(background, rgba).convert("RGB")
-            else:
+            elif image.mode != "RGB":
                 image = image.convert("RGB")
 
-            if max(image.size) > 3840:
-                scale = 3840 / max(image.size)
+            if max(image.size) > MAX_LONGEST_SIDE_PX:
+                scale = MAX_LONGEST_SIDE_PX / max(image.size)
                 size = (round(image.width * scale), round(image.height * scale))
                 image = image.resize(size, Image.Resampling.LANCZOS)
 
-            output = io.BytesIO()
-            image.save(
-                output,
-                format="JPEG",
-                quality=88,
-                progressive=False,
-                subsampling=2,
-                icc_profile=SRGB_PROFILE,
-                exif=b"",
-            )
-            return output.getvalue()
+            return image
     except ImageError:
         raise
     except Exception as exc:
         raise ImageError(f"invalid or unsupported image: {exc}") from exc
 
 
+def _encode_tv_jpeg(image: Image.Image, max_image_bytes: int) -> bytes:
+    if max_image_bytes < 1:
+        raise ImageError("max_image_bytes must be >= 1")
+    for quality in QUALITY_STEPS:
+        output = io.BytesIO()
+        image.save(
+            output,
+            format="JPEG",
+            quality=quality,
+            progressive=False,
+            subsampling=2,
+            optimize=True,
+            icc_profile=SRGB_PROFILE,
+            exif=b"",
+        )
+        candidate = output.getvalue()
+        if len(candidate) <= max_image_bytes:
+            return candidate
+    raise ImageError(
+        f"normalized JPEG exceeds max_image_bytes ({max_image_bytes} bytes) "
+        f"even at quality {QUALITY_STEPS[-1]}"
+    )
+
+
+def _encode_thumbnail_jpeg(image: Image.Image) -> bytes:
+    thumb = image.copy()
+    thumb.thumbnail(THUMBNAIL_MAX_SIZE, Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    thumb.save(
+        output,
+        format="JPEG",
+        quality=THUMBNAIL_QUALITY,
+        progressive=False,
+        subsampling=2,
+        optimize=True,
+        icc_profile=SRGB_PROFILE,
+        exif=b"",
+    )
+    return output.getvalue()
+
+
+def normalize_image_assets(
+    data: bytes,
+    *,
+    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> NormalizedAssets:
+    image = _prepare_rgb_image(data)
+    tv_bytes = _encode_tv_jpeg(image, max_image_bytes)
+    thumb_bytes = _encode_thumbnail_jpeg(image)
+    fingerprint = hashlib.sha256(tv_bytes).hexdigest()
+    return NormalizedAssets(
+        tv_bytes=tv_bytes,
+        thumb_bytes=thumb_bytes,
+        fingerprint=fingerprint,
+        byte_size=len(tv_bytes),
+        width=image.width,
+        height=image.height,
+    )
+
+
+def normalize_image(
+    data: bytes,
+    *,
+    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> bytes:
+    image = _prepare_rgb_image(data)
+    return _encode_tv_jpeg(image, max_image_bytes)
+
+
 def prepare_set(
-    images: list[SourceImage], snapshot_dir: Path
-) -> tuple[list[PreparedImage], list[str]]:
-    prepared: list[PreparedImage] = []
+    images: list[SourceImage],
+    snapshot_dir: Path,
+    *,
+    max_image_bytes: int = DEFAULT_MAX_IMAGE_BYTES,
+) -> tuple[list[LegacyPreparedImage], list[str]]:
+    prepared: list[LegacyPreparedImage] = []
     warnings: list[str] = []
     used: set[str] = set()
     for source in images:
         try:
-            before = _file_signature(source.path.stat())
-            if before != source.signature:
-                raise ImageError("source changed while its sync snapshot was being captured")
-            data = source.path.read_bytes()
-            if _file_signature(source.path.stat()) != before:
-                raise ImageError("source changed while its sync snapshot was being captured")
-            normalized = normalize_image(data)
+            data, _signature = read_verified_source(
+                source.path,
+                expected_signature=source.signature,
+                race_message="source changed while its sync snapshot was being captured",
+            )
+            normalized = normalize_image(data, max_image_bytes=max_image_bytes)
             filename = safe_filename(source.name_rel, used)
             staged_path = snapshot_dir / filename
-            staged_path.write_bytes(normalized)
+            atomic_write_bytes(staged_path, normalized, mode=0o600, fsync=False)
             prepared.append(
-                PreparedImage(
+                LegacyPreparedImage(
                     source_rel=source.source_rel,
                     filename=filename,
                     fingerprint=hashlib.sha256(normalized).hexdigest(),
