@@ -139,6 +139,9 @@ class WebServerBoundaryAndStaticTests(unittest.TestCase):
 
         self.assertIn(".card { min-width: 0; }", css)
         self.assertIn(".filename { overflow-wrap: anywhere; }", css)
+        self.assertIn("aspect-ratio: 16 / 9", css)
+        self.assertIn("object-fit: contain", css)
+        self.assertNotIn("object-fit: cover", css)
 
 
 class WebServerFrontendBehaviorTests(unittest.TestCase):
