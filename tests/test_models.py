@@ -107,7 +107,7 @@ class ModelsTests(unittest.TestCase):
         self.assertEqual(OCCASION_PREFIX, "occasion:")
         self.assertEqual(ART_STORE_FAVORITES_CATEGORY, "MY-C0004")
         self.assertEqual(ART_STORE_ID_PREFIX, "SAM-")
-        self.assertEqual(NORMALIZATION_VERSION, 1)
+        self.assertEqual(NORMALIZATION_VERSION, 2)
 
         self.assertTrue(issubclass(LibraryError, FrameArtError))
         self.assertTrue(issubclass(ImageError, ValueError))

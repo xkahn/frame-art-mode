@@ -17,7 +17,7 @@ ROOT_SET = "root"
 OCCASION_PREFIX = "occasion:"
 ART_STORE_FAVORITES_CATEGORY = "MY-C0004"
 ART_STORE_ID_PREFIX = "SAM-"
-NORMALIZATION_VERSION = 1
+NORMALIZATION_VERSION = 2
 
 VALID_OPERATION_RESULTS = frozenset({"completed", "aborted", "failed", "interrupted"})
 

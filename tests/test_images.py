@@ -146,6 +146,22 @@ class ImagePipelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ImageError, "animated"):
             normalize_image(webp_output.getvalue())
 
+    def test_mpo_uses_primary_static_frame_only(self):
+        primary = Image.new("RGB", (800, 640), (200, 50, 50))
+        secondary = Image.new("RGB", (320, 240), (50, 50, 200))
+        mpo_output = io.BytesIO()
+        primary.save(mpo_output, format="MPO", save_all=True, append_images=[secondary])
+
+        normalized = normalize_image(mpo_output.getvalue())
+        with Image.open(io.BytesIO(normalized)) as output:
+            self.assertEqual(output.format, "JPEG")
+            self.assertEqual(output.size, (800, 640))
+            self.assertEqual(getattr(output, "n_frames", 1), 1)
+            self.assertFalse(getattr(output, "is_animated", False))
+            pixel = output.getpixel((400, 320))
+            self.assertGreater(pixel[0], 170)
+            self.assertLess(pixel[2], 80)
+
     def test_rejects_invalid_and_mismatched_embedded_color_profiles(self):
         source = image_bytes(fmt="JPEG", icc_profile=b"not an ICC profile")
         with self.assertRaisesRegex(ImageError, "ICC"):

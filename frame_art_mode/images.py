@@ -314,10 +314,14 @@ def _prepare_rgb_image(data: bytes) -> Image.Image:
         raise ImageError("image file is empty")
     try:
         with Image.open(io.BytesIO(data)) as original:
-            if original.format == "GIF" and getattr(original, "n_frames", 1) != 1:
-                raise ImageError("animated GIFs are not supported")
-            if getattr(original, "is_animated", False) or getattr(original, "n_frames", 1) > 1:
-                raise ImageError(f"animated {original.format or 'image'}s are not supported")
+            if original.format == "MPO":
+                # Phone motion/gainmap photos wrap secondary frames in MPO; keep frame 0 only.
+                original.seek(0)
+            else:
+                if original.format == "GIF" and getattr(original, "n_frames", 1) != 1:
+                    raise ImageError("animated GIFs are not supported")
+                if getattr(original, "is_animated", False) or getattr(original, "n_frames", 1) > 1:
+                    raise ImageError(f"animated {original.format or 'image'}s are not supported")
             embedded_profile = original.info.get("icc_profile")
             original.load()
             image = ImageOps.exif_transpose(original)
