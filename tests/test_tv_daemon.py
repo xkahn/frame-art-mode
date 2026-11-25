@@ -1707,6 +1707,50 @@ class TVDaemonTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(self.art.current, id2)
 
+    def test_paused_cycling_auto_resumes_on_next_interval_when_tv_returns(self):
+        self.library.put_image("root", "photo2.jpg", b"\xff\xd8\xff\xe0green\xff\xd9")
+        self.daemon.save_settings("root", random=False, interval_minutes=1)
+        synced = self._sync_and_wait(self.daemon, "root")
+        id1, id2 = [e["content_id"] for e in synced["entries"]]
+        self.assertEqual(self.art.current, id1)
+
+        # TV drops out of Art Mode overnight -> cycling pauses and hides next_rotation_at
+        self.art.mode = "off"
+        self.assertFalse(self.daemon.run_slideshow_tick())
+        paused = self.daemon.status()
+        self.assertTrue(paused["cycling_paused"])
+        self.assertFalse(paused["tv_ready"])
+        self.assertIsNone(paused["next_rotation_at"])
+
+        # Zero busy/tight TV polling while paused
+        self.art.calls.clear()
+        self.daemon.start()
+        time.sleep(0.05)
+        self.assertEqual(self.art.calls, [])
+
+        # TV returns to Art Mode; once the interval elapses, actor auto-resumes without check_tv()
+        self.art.mode = "on"
+        self.clock.advance(61.0)
+        self.daemon._actor_wake_event.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            snap = self.daemon.status()
+            if (
+                not snap["cycling_paused"]
+                and snap["tv_ready"] is True
+                and self.art.current == id2
+                and self.daemon.wait_for_idle(timeout=0.05)
+            ):
+                break
+            time.sleep(0.01)
+
+        resumed = self.daemon.status()
+        self.assertEqual(self.art.current, id2)
+        self.assertFalse(resumed["cycling_paused"])
+        self.assertTrue(resumed["tv_ready"])
+        self.assertIsNone(resumed["last_error"])
+        self.assertIsNotNone(resumed["next_rotation_at"])
+
     # ------------------------------------------------------------------
     # IPC Validation, Concurrency, Signals & CLI Edge Cases
     # ------------------------------------------------------------------

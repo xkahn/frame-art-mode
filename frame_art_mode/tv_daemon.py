@@ -932,6 +932,7 @@ class TVDaemon:
                     )
                 self._paused_remaining = None
                 self._schedule_next_rotation(delay)
+                self._actor_wake_event.set()
             else:
                 self._paused_remaining = None
 
@@ -941,6 +942,13 @@ class TVDaemon:
                 if self._next_at_mono is not None and self._paused_remaining is None:
                     self._paused_remaining = max(0.0, self._next_at_mono - self._clock())
                 self._cycling_paused = True
+                interval_seconds = (
+                    self._manifest.settings_for(
+                        self._manifest.active_set
+                    ).interval_minutes
+                    * 60.0
+                )
+                self._schedule_next_rotation(interval_seconds)
             self._last_error = reason
 
     def _candidates_for_random_pick(
@@ -1064,8 +1072,7 @@ class TVDaemon:
     def _next_idle_wait_seconds(self) -> float | None:
         with self._state_lock:
             if (
-                self._cycling_paused
-                or self._manifest_error is not None
+                self._manifest_error is not None
                 or self._manifest.active_set is None
                 or not self._manifest.entries
                 or self._next_at_mono is None
@@ -2194,8 +2201,7 @@ class TVDaemon:
         """Execute one slideshow rotation tick if an active set has entries."""
         with self._state_lock:
             if (
-                self._cycling_paused
-                or self._manifest_error is not None
+                self._manifest_error is not None
                 or self._manifest.active_set is None
                 or not self._manifest.entries
             ):
@@ -2293,7 +2299,13 @@ class TVDaemon:
                 self._cycling_paused = False
                 self._paused_remaining = None
                 self._schedule_next_rotation(settings.interval_minutes * 60.0)
-                if self._last_error and self._last_error.startswith("cycling paused:"):
+                if self._last_error and (
+                    self._last_error.startswith("cycling paused:")
+                    or self._last_error.startswith("TV is unavailable")
+                    or self._last_error.startswith("TV is not in Art Mode")
+                    or self._last_error.startswith("preview restore failed:")
+                    or self._last_error.startswith("preview ")
+                ):
                     self._last_error = None
 
             self._update_operation(
