@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>Frame Art Mode</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="top-bar">
+      <div class="brand-row">
+        <div class="brand-title">
+          <h1>Frame Art Mode</h1>
+          <span id="live-connection" class="connection-pill">Connecting…</span>
+        </div>
+        <button
+          id="warnings-toggle-btn"
+          type="button"
+          class="warnings-badge"
+          aria-expanded="false"
+          aria-controls="warnings-drawer"
+          hidden
+        >
+          <span id="warnings-count">0</span> warnings
+        </button>
+      </div>
+
+      <section id="warnings-drawer" class="warnings-drawer" hidden aria-live="polite">
+        <div class="warnings-drawer-header">
+          <h2>Warnings &amp; Diagnostics</h2>
+          <button id="warnings-close-btn" type="button" class="btn-ghost">Close</button>
+        </div>
+        <ul id="warnings-list" class="warnings-list"></ul>
+      </section>
+
+      <div class="status-grid">
+        <section class="status-panel" aria-label="Service Health">
+          <h2 class="panel-heading">Service Health</h2>
+          <ul class="health-list">
+            <li class="health-item">
+              <span id="dot-web" class="status-dot is-ok"></span>
+              <span class="health-name">Web</span>
+              <span id="status-web" class="health-state">online</span>
+            </li>
+            <li class="health-item">
+              <span id="dot-tv" class="status-dot"></span>
+              <span class="health-name">TV Daemon</span>
+              <span id="status-tv" class="health-state">checking</span>
+              <span id="error-tv" class="health-error" hidden></span>
+            </li>
+            <li class="health-item">
+              <span id="dot-library" class="status-dot"></span>
+              <span class="health-name">Library Cache</span>
+              <span id="status-library" class="health-state">checking</span>
+              <span id="error-library" class="health-error" hidden></span>
+            </li>
+          </ul>
+        </section>
+
+        <section class="status-panel" aria-label="TV Status">
+          <h2 class="panel-heading">TV Status</h2>
+          <div class="panel-body-row">
+            <span id="tv-ready-badge" class="status-pill">Not checked yet</span>
+            <button id="check-tv-btn" type="button" class="btn-secondary">Check TV</button>
+          </div>
+          <p id="tv-status-detail" class="muted-note">No idle polling; click Check TV to query Art Mode.</p>
+        </section>
+
+        <section class="status-panel" aria-label="Now Playing">
+          <h2 class="panel-heading">Now Playing</h2>
+          <div class="now-playing-row">
+            <div id="now-playing-thumb-wrap" class="now-playing-thumb-wrap">
+              <img id="now-playing-img" class="now-playing-thumb" alt="" hidden>
+              <div id="now-playing-placeholder" class="now-playing-placeholder">Art</div>
+            </div>
+            <div class="now-playing-meta">
+              <div class="now-playing-set">
+                Active set: <strong id="active-set-label">None</strong>
+              </div>
+              <div id="now-playing-title" class="now-playing-title">Nothing displaying</div>
+              <div id="now-playing-countdown" class="muted-note">No active rotation</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="status-panel" aria-label="Library Summary">
+          <h2 class="panel-heading">Library Summary</h2>
+          <div id="library-counts" class="library-counts">0 valid, 0 skipped</div>
+          <div id="library-refreshed" class="muted-note">Never refreshed</div>
+          <div id="viewed-sync-state" class="sync-state-note">Checking set state…</div>
+        </section>
+      </div>
+    </header>
+
+    <section id="operation-bar" class="operation-bar" hidden aria-live="polite">
+      <div class="operation-main">
+        <span class="spinner" aria-hidden="true"></span>
+        <div class="operation-text">
+          <div class="operation-title">
+            <strong id="operation-label">Working…</strong>
+            <span id="operation-counts" class="operation-counts"></span>
+          </div>
+          <div id="operation-item" class="operation-item" hidden></div>
+          <div id="operation-secondary" class="operation-secondary" hidden></div>
+        </div>
+        <button id="abort-btn" type="button" class="btn-danger">Abort</button>
+      </div>
+      <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="operation-progress-fill" class="progress-fill"></div>
+      </div>
+    </section>
+
+    <section class="controls-panel" aria-label="Set Controls">
+      <div class="controls-row">
+        <label class="control-field">
+          <span>Viewed set</span>
+          <select id="set-select" name="set_id"></select>
+        </label>
+
+        <label class="control-checkbox">
+          <input id="setting-random" type="checkbox">
+          <span>Random order</span>
+        </label>
+
+        <label class="control-checkbox">
+          <input id="setting-favorites" type="checkbox">
+          <span>Mix Art Store favorites</span>
+        </label>
+
+        <label class="control-field control-number">
+          <span>Minutes per image</span>
+          <input id="setting-interval" type="number" min="1" step="1" value="15">
+        </label>
+      </div>
+
+      <div class="controls-actions">
+        <button id="save-settings-btn" type="button" class="btn-secondary">Save settings</button>
+        <button id="sync-btn" type="button" class="btn-primary">Sync to TV</button>
+        <button id="refresh-btn" type="button" class="btn-secondary">Refresh library</button>
+        <span class="muted-note">
+          Switching viewed set only previews the library; Sync to TV updates the TV.
+        </span>
+      </div>
+    </section>
+
+    <main class="gallery-section">
+      <div class="gallery-header">
+        <h2 id="gallery-heading">Images</h2>
+        <span id="gallery-subtitle" class="muted-note"></span>
+      </div>
+      <p id="gallery-empty" class="empty-state" hidden></p>
+      <div id="gallery-grid" class="grid"></div>
+    </main>
+  </div>
+
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+
+  <template id="card-template">
+    <article class="card">
+      <div class="card-media">
+        <img class="card-img" loading="lazy" alt="" hidden>
+        <div class="thumb-placeholder">No thumbnail</div>
+      </div>
+      <div class="card-body">
+        <div class="card-pills"></div>
+        <div class="filename"></div>
+        <div class="card-skip-reason" hidden></div>
+        <div class="card-actions">
+          <button type="button" class="btn-preview" hidden></button>
+        </div>
+      </div>
+    </article>
+  </template>
+
+  <template id="toast-template">
+    <div class="toast" role="status">
+      <span class="toast-message"></span>
+      <button type="button" class="toast-reload" hidden>Reload</button>
+      <button type="button" class="toast-dismiss" aria-label="Dismiss notification">&times;</button>
+    </div>
+  </template>
+
+  <script id="initial-state" type="application/json">{{ initial_state | tojson }}</script>
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>

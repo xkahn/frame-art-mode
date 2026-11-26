@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from frame_art_mode.main import require_supported_python
+from frame_art_mode.supervisor import require_supported_python
 
 
 class PythonRuntimeTests(unittest.TestCase):
@@ -22,10 +22,12 @@ class PythonRuntimeTests(unittest.TestCase):
         readme = (root / "README.md").read_text(encoding="utf-8")
         launcher = (root / "start.sh").read_text(encoding="utf-8")
         self.assertIn("python3.11 -m venv .venv", readme)
-        self.assertIn("created by Python 3.8", readme)
+        self.assertIn("existing Python 3.8 `.venv`", readme)
         self.assertIn("Python 3.10 or later", readme)
         self.assertIn('sys.version_info < (3, 10)', launcher)
         self.assertIn("Recreate", launcher)
+        self.assertIn("frame_art_mode.supervisor", launcher)
+        self.assertNotIn("frame_art_mode.main", launcher)
 
     def test_launcher_rejects_simulated_python38_and_accepts_311(self):
         source_root = Path(__file__).resolve().parents[1]

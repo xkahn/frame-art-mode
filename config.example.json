@@ -1,7 +1,26 @@
+// Frame Art Mode configuration (JSONC: // and /* ... */ comments and trailing commas are supported)
 {
+  // Required: reserved LAN IP of The Frame TV and specific unicast LAN IP of this NAS
   "tv_ip": "192.168.1.50",
   "bind_ip": "192.168.1.20",
+
+  // Web UI port (1-65535)
   "port": 8080,
+
+  // Paths: state_dir and cache_dir must live outside image_root
   "image_root": "/volume1/photo/FrameArt",
-  "state_dir": "/volume1/applications/frame-art-mode-state"
+  "state_dir": "/volume1/applications/frame-art-mode-state",
+  "cache_dir": "/volume1/applications/frame-art-mode-state/cache",
+
+  // Optional playback & TV-safe image limits
+  "preview_seconds": 15,
+  "max_image_bytes": 5242880, // 5 MB TV-safe JPEG cap
+
+  // Optional anti-wedge TV pacing and timeout settings
+  "tv_op_delay_seconds": 3.0,
+  "tv_batch_settle_seconds": 12.0,
+  "tv_timeout_seconds": 30.0,
+  "tv_verify_retries": 4,
+  "tv_verify_interval_seconds": 3.0,
+  "max_set_images_warning": 50
 }

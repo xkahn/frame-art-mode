@@ -18,4 +18,4 @@ if ! "$VENV_PY" -c 'import sys; raise SystemExit(sys.version_info < (3, 10))' ; 
     exit 2
 fi
 
-exec "$VENV_PY" -m frame_art_mode.main --config "$SCRIPT_DIR/config.json" "$@"
+exec "$VENV_PY" -m frame_art_mode.supervisor --config "$SCRIPT_DIR/config.json" "$@"
