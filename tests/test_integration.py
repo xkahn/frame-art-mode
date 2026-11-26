@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,7 +25,13 @@ from frame_art_mode.config import Config
 from frame_art_mode.ipc import call_json
 from frame_art_mode.library_daemon import LibraryService, create_library_ipc_server
 from frame_art_mode.models import TVArtClient, ensure_private_dir
-from frame_art_mode.supervisor import ChildSpec, Supervisor, build_child_specs, main as supervisor_main
+from frame_art_mode.supervisor import (
+    ChildSpec,
+    Supervisor,
+    build_child_specs,
+    main as supervisor_main,
+    stop_supervisor,
+)
 from frame_art_mode.tv_daemon import TVDaemon, build_tv_ipc_server
 from frame_art_mode.web_server import create_app
 
@@ -912,6 +919,86 @@ class SupervisorSubprocessIntegrationTests(unittest.TestCase):
         self.assertFalse(cfg.library_sock.exists())
         self.assertIn("tv_daemon exited with fatal status 2", output)
         self.assertEqual(output.count("Starting tv_daemon"), 1)
+
+    def test_supervisor_pid_file_and_stop_sh_lifecycle(self):
+        port = _free_local_port()
+        cfg_path, cfg = self._write_config(port)
+
+        # 1. Missing PID file -> exits 0 cleanly
+        self.assertFalse(cfg.supervisor_pid.exists())
+        self.assertEqual(stop_supervisor(cfg.supervisor_pid), 0)
+
+        # 2. Stale dead PID file -> unlinks and exits 0
+        ensure_private_dir(cfg.state_dir)
+        cfg.supervisor_pid.write_text("999999\n", encoding="utf-8")
+        self.assertEqual(stop_supervisor(cfg.supervisor_pid), 0)
+        self.assertFalse(cfg.supervisor_pid.exists())
+
+        # 3. Unrelated live PID -> refuses to signal it, unlinks stale PID file
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            cwd=REPO_ROOT,
+        )
+        try:
+            cfg.supervisor_pid.write_text(f"{unrelated.pid}\n", encoding="utf-8")
+            self.assertEqual(stop_supervisor(cfg.supervisor_pid), 0)
+            self.assertFalse(cfg.supervisor_pid.exists())
+            self.assertIsNone(unrelated.poll())
+        finally:
+            unrelated.terminate()
+            unrelated.wait(timeout=5.0)
+
+        # 4. Live supervisor writes 0600 supervisor.pid and stop.sh stops it cleanly
+        sup_proc = subprocess.Popen(
+            [sys.executable, "-m", "frame_art_mode.supervisor", "--config", str(cfg_path)],
+            cwd=REPO_ROOT,
+            env=self._sub_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+        def _ensure_stopped() -> None:
+            if sup_proc.poll() is None:
+                sup_proc.kill()
+                sup_proc.wait(timeout=5.0)
+            if sup_proc.stdout is not None:
+                sup_proc.stdout.close()
+
+        self.addCleanup(_ensure_stopped)
+
+        _wait_until(
+            lambda: (
+                (res := self._http_json(port, "GET", "/api/status"))[0] == 200
+                and res[1]["degraded"] is False
+                and cfg.supervisor_pid.is_file()
+            ),
+            timeout=15.0,
+            interval=0.1,
+            desc="supervisor healthy with PID file",
+        )
+        self.assertEqual(stat.S_IMODE(cfg.supervisor_pid.stat().st_mode), 0o600)
+        self.assertEqual(int(cfg.supervisor_pid.read_text(encoding="utf-8").strip()), sup_proc.pid)
+
+        tv_pid = call_json(cfg.tv_sock, "GET", "/health")["pid"]
+        lib_pid = call_json(cfg.library_sock, "GET", "/health")["pid"]
+
+        stop_proc = subprocess.run(
+            [str(REPO_ROOT / "stop.sh"), "--config", str(cfg_path)],
+            cwd=REPO_ROOT,
+            env=self._sub_env(),
+            capture_output=True,
+            text=True,
+            timeout=20.0,
+        )
+        self.assertEqual(stop_proc.returncode, 0, stop_proc.stderr)
+        self.assertEqual(sup_proc.wait(timeout=10.0), 0)
+        self.assertFalse(cfg.supervisor_pid.exists())
+        self.assertFalse(cfg.tv_sock.exists())
+        self.assertFalse(cfg.library_sock.exists())
+        for child_pid in (tv_pid, lib_pid):
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, TextIO
@@ -130,6 +131,142 @@ def _default_process_factory(command: Sequence[str]) -> subprocess.Popen[str]:
     )
 
 
+def _write_pid_file(pid_file: Path) -> None:
+    """Create pid_file parent (0700) and atomically write the current PID (0600)."""
+    pid_file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(pid_file.parent, 0o700)
+    except OSError:
+        pass
+    payload = f"{os.getpid()}\n".encode("utf-8")
+    with tempfile.NamedTemporaryFile(
+        dir=pid_file.parent,
+        prefix=f".{pid_file.name}-",
+        delete=False,
+    ) as handle:
+        temp_path = Path(handle.name)
+        try:
+            handle.write(payload)
+            handle.flush()
+            os.chmod(temp_path, 0o600)
+            temp_path.replace(pid_file)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+
+
+def _remove_pid_file(pid_file: Path, expected_pid: int) -> None:
+    """Remove pid_file only if it still records expected_pid."""
+    try:
+        recorded = pid_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    if recorded == str(expected_pid):
+        try:
+            pid_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _is_zombie_pid(pid: int) -> bool:
+    stat_path = Path(f"/proc/{pid}/stat")
+    try:
+        stat_text = stat_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    rparen = stat_text.rfind(")")
+    if rparen == -1:
+        return False
+    rest = stat_text[rparen + 1 :].lstrip()
+    return rest.startswith("Z")
+
+
+def stop_supervisor(
+    pid_file: Path,
+    *,
+    timeout: float = 15.0,
+    poll_interval: float = 0.1,
+) -> int:
+    """Stop a running supervisor recorded in pid_file via SIGTERM and wait for exit."""
+    if not pid_file.exists():
+        print(f"Frame Art Mode is not running (no PID file at {pid_file}).")
+        return 0
+
+    try:
+        raw_pid = pid_file.read_text(encoding="utf-8").strip()
+        pid = int(raw_pid)
+    except (OSError, ValueError):
+        pid_file.unlink(missing_ok=True)
+        print(f"Removed invalid PID file at {pid_file}.")
+        return 0
+
+    if pid <= 1:
+        pid_file.unlink(missing_ok=True)
+        print(f"Removed invalid PID file ({pid}) at {pid_file}.")
+        return 0
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        _remove_pid_file(pid_file, pid)
+        print(f"Frame Art Mode is not running (removed stale PID {pid}).")
+        return 0
+    except PermissionError as exc:
+        print(
+            f"ERROR: cannot signal PID {pid} from {pid_file}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    cmdline_path = Path(f"/proc/{pid}/cmdline")
+    try:
+        cmdline = cmdline_path.read_bytes()
+    except OSError:
+        cmdline = b""
+    if cmdline and b"frame_art_mode.supervisor" not in cmdline:
+        _remove_pid_file(pid_file, pid)
+        print(
+            f"PID {pid} is not frame_art_mode.supervisor; removed stale PID file without signaling."
+        )
+        return 0
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _remove_pid_file(pid_file, pid)
+        print(f"Frame Art Mode (PID {pid}) already exited.")
+        return 0
+    except PermissionError as exc:
+        print(f"ERROR: failed to stop PID {pid}: {exc}", file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    step = max(0.02, float(poll_interval))
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            _remove_pid_file(pid_file, pid)
+            print(f"Stopped Frame Art Mode supervisor (PID {pid}).")
+            return 0
+        except PermissionError:
+            break
+        if _is_zombie_pid(pid):
+            _remove_pid_file(pid_file, pid)
+            print(f"Stopped Frame Art Mode supervisor (PID {pid}).")
+            return 0
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(step, remaining))
+
+    print(
+        f"ERROR: Frame Art Mode supervisor (PID {pid}) did not stop within {timeout:.1f}s.",
+        file=sys.stderr,
+    )
+    return 1
+
+
 class Supervisor:
     """Lightweight supervisor managing library_daemon, tv_daemon, and web_server."""
 
@@ -146,6 +283,7 @@ class Supervisor:
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
         poll_interval: float = DEFAULT_POLL_INTERVAL,
         output_stream: TextIO | None = None,
+        pid_file: Path | None = None,
     ) -> None:
         if not specs:
             raise ValueError("specs must not be empty")
@@ -170,6 +308,7 @@ class Supervisor:
         self.shutdown_timeout = float(shutdown_timeout)
         self.poll_interval = float(poll_interval)
         self._output_stream = output_stream
+        self._pid_file = pid_file
 
         self._stop_event = threading.Event()
         self._output_lock = threading.Lock()
@@ -326,6 +465,8 @@ class Supervisor:
                 signal.signal(sig, _handle_signal)
 
         try:
+            if self._pid_file is not None:
+                _write_pid_file(self._pid_file)
             while not self._stop_event.is_set():
                 now = self._clock()
 
@@ -412,6 +553,8 @@ class Supervisor:
             self._shutdown_children()
             return 0
         finally:
+            if self._pid_file is not None:
+                _remove_pid_file(self._pid_file, os.getpid())
             if in_main_thread:
                 for sig, handler in previous_handlers.items():
                     signal.signal(sig, handler)
@@ -429,6 +572,17 @@ def _build_arg_parser(default_config_path: Path) -> argparse.ArgumentParser:
     parser.add_argument("--image-root", type=Path)
     parser.add_argument("--state-dir", type=Path)
     parser.add_argument("--cache-dir", type=Path)
+    parser.add_argument(
+        "--stop",
+        action="store_true",
+        help="Stop a running supervisor recorded in state_dir/supervisor.pid.",
+    )
+    parser.add_argument(
+        "--stop-timeout",
+        type=float,
+        default=15.0,
+        help="Seconds to wait for the supervisor to exit during --stop.",
+    )
     return parser
 
 
@@ -460,13 +614,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cache_dir": args.cache_dir,
     }
     try:
-        load_config(args.config, overrides, script_dir=script_dir)
+        config = load_config(args.config, overrides, script_dir=script_dir)
     except ConfigError as exc:
         logger.error("Invalid configuration: %s", exc)
         return 2
 
+    if args.stop:
+        return stop_supervisor(config.supervisor_pid, timeout=args.stop_timeout)
+
     specs = build_child_specs(args.config.resolve(), overrides)
-    supervisor = Supervisor(specs)
+    supervisor = Supervisor(specs, pid_file=config.supervisor_pid)
     return supervisor.run()
 
 

@@ -74,9 +74,11 @@ deleted.
    `0600` permissions inside `state_dir`.
 
 `start.sh` launches the Python supervisor (`frame_art_mode.supervisor`), which
-starts and monitors `library_daemon`, `tv_daemon`, and `web_server`. If a
-backend daemon crashes, the supervisor restarts it with backoff while keeping
-the Web UI online in degraded mode.
+starts and monitors `library_daemon`, `tv_daemon`, and `web_server`, and
+records its PID in `state_dir/supervisor.pid`. If a backend daemon crashes,
+the supervisor restarts it with backoff while keeping the Web UI online in
+degraded mode. Use `./stop.sh` to send `SIGTERM` cleanly and wait for all
+processes to exit (or `./stop.sh && ./start.sh` to restart).
 
 ### Standalone CLI Usage
 

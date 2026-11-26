@@ -40,6 +40,7 @@ All mutable runtime state lives inside `state_dir` (created with `0700` permissi
 
 ```text
 <state_dir>/                          # chmod 0700 (owned by dedicated non-admin NAS user)
+├── supervisor.pid                    # PID file for stop.sh / --stop (0600)
 ├── library.lock                      # fcntl exclusive lock held by library_daemon
 ├── library.sock                      # Unix domain socket for library_daemon
 ├── cache/                            # Default cache_dir (overridable via config.cache_dir)
@@ -256,7 +257,7 @@ For every new or modified source file (detected via `(st_dev, st_ino, st_size, s
 ### 7.2 Standalone CLI Entrypoints
 
 Every component can be run or inspected directly over SSH:
-- `python -m frame_art_mode.supervisor [--config PATH]`
+- `python -m frame_art_mode.supervisor [--config PATH] [--stop]` (`stop.sh` invokes `--stop`)
 - `python -m frame_art_mode.tv_daemon [serve | status | check | sync <set_id> | abort | preview <content_id>]`
 - `python -m frame_art_mode.library_daemon [serve | status | refresh [--set <set_id>] [--offline] | abort]`
 - `python -m frame_art_mode.web_server [serve]`

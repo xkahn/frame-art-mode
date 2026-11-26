@@ -59,6 +59,7 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.tv_sock, config.state_dir / expected_tv_key / "tv.sock")
             self.assertEqual(config.library_lock, config.state_dir / "library.lock")
             self.assertEqual(config.tv_lock, config.state_dir / expected_tv_key / "tv.lock")
+            self.assertEqual(config.supervisor_pid, config.state_dir / "supervisor.pid")
 
     def test_optional_keys_and_relative_cache_dir(self):
         with tempfile.TemporaryDirectory() as temporary:

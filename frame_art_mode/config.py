@@ -62,6 +62,10 @@ class Config:
     def tv_lock(self) -> Path:
         return self.tv_dir / "tv.lock"
 
+    @property
+    def supervisor_pid(self) -> Path:
+        return self.state_dir / "supervisor.pid"
+
 
 def _parse_int(
     raw: dict[str, Any],
